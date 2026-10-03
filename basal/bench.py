@@ -1,7 +1,7 @@
 """Offline benchmark of a serving mode (no HTTP): latency, throughput, agreement with an fp32 reference, accuracy.
 
-  basal-bench --model Remek/basal-1.0-4.5B --modes eager-fp32 fast fp8              # bundled examples
-  basal-bench --model Remek/basal-1.0-4.5B --modes eager-fp32 fast --questions my_items.jsonl
+  basal-bench --model Remek/basal-1.5-4.5B --modes eager-fp32 fast fp8              # bundled examples
+  basal-bench --model Remek/basal-1.5-4.5B --modes eager-fp32 fast --questions my_items.jsonl
 
 Questions file (JSONL): {"state": ..., "question": ..., "options": [...], "gold": <index, optional>}.
 Measured per mode (same definitions as in the technical report):
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import torch
 
-from .engine import EagerBackend, ExitGraphBackend, GraphBackend, VLLMBackend, resolve
+from .engine import EagerBackend, ExitGraphBackend, GraphBackend, SGLangBackend, VLLMBackend, resolve
 from .prompt import letter_ids, render
 from .server import MODES
 
@@ -36,6 +36,8 @@ def build(mode, md, vllm_model=None):
         return EagerBackend(md, "bfloat16")
     if kind == "vllm":
         return VLLMBackend(vllm_model or md)
+    if kind == "sglang":
+        return SGLangBackend(md)
     if kind == "exit":
         return ExitGraphBackend(md, "bfloat16", quant, compile=comp)
     return GraphBackend(md, "bfloat16", quant, compile=comp, shared=True)
@@ -84,7 +86,9 @@ def cold(be):
     that every timed call computes its prompt (the second option order may still reuse the first order's prefix, as in
     real serving)."""
     if hasattr(be, "llm"):
-        be.llm.reset_prefix_cache()
+        clear = getattr(be.llm, "reset_prefix_cache", None) or getattr(be.llm, "flush_cache", None)  # vLLM / SGLang
+        if clear is not None:
+            clear()
 
 
 def timed(fn, reps, be=None):
@@ -117,10 +121,10 @@ def measure(be, groups, lat_n):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default="Remek/basal-1.0-4.5B")
+    ap.add_argument("--model", default="Remek/basal-1.5-4.5B")
     ap.add_argument("--vllm-model", dest="vllm_model", default=None, help="checkpoint for --modes vllm (e.g. the NVFP4 repo)")
     ap.add_argument("--modes", nargs="+", default=["eager-fp32", "fast"],
-                    help="eager-fp32, eager, fast, fast-nocompile, fp8, nvfp4, vllm, fast-exit@off|0.999|0.995|0.99|0.98")
+                    help="eager-fp32, eager, fast, fast-nocompile, fp8, nvfp4, vllm, sglang, fast-exit@off|0.999|0.995|0.99|0.98")
     ap.add_argument("--questions", nargs="+", default=DEFAULT_QUESTIONS,
                     help="JSONL file(s) with simple items (default: the bundled examples, 44 items)")
     ap.add_argument("--n", type=int, default=500)

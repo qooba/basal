@@ -1,7 +1,10 @@
 """Inference backends. Every backend exposes the same two calls:
 
   run(prompts, ids_list)          -> one probability list per prompt (softmax over its option letters)
-  run_shared(groups[, policy])    -> groups = [(prompts, ids_list)], all option orders of one question in one group
+  run_shared(groups[, policy])    -> groups = [(prompts, ids_list)]; the prompts of one group share a prefix (all option
+                                     orders of one question, or every branch of a whole request: state once, ask many)
+
+A prompt is a string or a list of token ids (the server tokenizes once and passes ids).
 
 Backends:
   EagerBackend      plain PyTorch forward (reference, any GPU or CPU)
@@ -9,23 +12,44 @@ Backends:
                     token-budget batching, optional torchao FP8 / NVFP4 quantisation
   ExitGraphBackend  GraphBackend split into graph segments at trained early-exit layers; exit policy per request
   VLLMBackend       vLLM, for ModelOpt FP8 / NVFP4 checkpoints (native low-precision kernels)
+  SGLangBackend     SGLang offline engine (1.5): the same letter readout from the log-probabilities of the option tokens
+  MLXBackend        Apple Silicon, MLX / mlx-lm (1.5): MLX fp8 / fp4 exports or bf16 weights; shared-prefix KV cache
+  OllamaBackend     Ollama with the GGUF exports (1.5): raw prompt, one token, top log-probabilities of the letters
+  LlamaCppBackend   llama.cpp server with the GGUF exports (1.5): token-id prompt, `n_probs` log-probabilities
 """
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .prompt import PREFILL
 
 
-def resolve(name, revision=None):
-    """Local directory or Hugging Face repo id (downloaded once to the HF cache)."""
+METADATA_FILES = ["*.json", "*.jinja", "*.model", "*.txt", "*.md", "Modelfile*"]  # tokenizer, template, calibration
+
+
+def resolve(name, revision=None, metadata_only=False):
+    """Local directory or Hugging Face repo id (downloaded once to the HF cache). metadata_only: tokenizer, chat
+    template and calibration files only (the Ollama / llama.cpp modes, where the engine serves the GGUF weights)."""
     p = Path(name)
     if p.exists():
         return p
     from huggingface_hub import snapshot_download
-    return Path(snapshot_download(name, revision=revision))
+    return Path(snapshot_download(name, revision=revision, allow_patterns=METADATA_FILES if metadata_only else None))
+
+
+def default_device():
+    """BASAL_DEVICE if set, else cuda, else Apple Silicon (mps), else cpu."""
+    import os
+    if os.environ.get("BASAL_DEVICE"):
+        return os.environ["BASAL_DEVICE"]
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 class EagerBackend:
@@ -33,15 +57,28 @@ class EagerBackend:
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.padding_side = "left"
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
-        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        dev = device or default_device()
         self.model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=getattr(torch, dtype)).to(dev).eval()
         self.dev = dev
         self.prefill = PREFILL
 
+    def encode(self, prompts):
+        """Strings -> token id lists (one batched tokenizer call); id lists pass through."""
+        txt = [k for k, p in enumerate(prompts) if isinstance(p, str)]
+        out = list(prompts)
+        if txt:
+            for k, ids in zip(txt, self.tok([prompts[k] for k in txt], add_special_tokens=False).input_ids):
+                out[k] = ids
+        return out
+
     @torch.no_grad()
     def run(self, prompts, ids_list):
-        enc = self.tok(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(self.dev)
-        logits = self.model(**enc, logits_to_keep=1).logits[:, -1, :].float()
+        enc = self.encode(prompts)
+        L = max(map(len, enc))
+        pad = self.tok.pad_token_id
+        ids = torch.tensor([[pad] * (L - len(e)) + list(e) for e in enc], device=self.dev)
+        att = torch.tensor([[0] * (L - len(e)) + [1] * len(e) for e in enc], device=self.dev)
+        logits = self.model(input_ids=ids, attention_mask=att, logits_to_keep=1).logits[:, -1, :].float()
         lp = torch.log_softmax(logits, -1)
         return [torch.softmax(lp[b, ids], -1).tolist() for b, ids in enumerate(ids_list)]
 
@@ -60,9 +97,11 @@ class GraphBackend(EagerBackend):
     would stall the server). With `shared`, the option orders of one question are packed into ONE row:
     [shared prefix | options order 1 | options order 2], positions of each option block continue from the end of the
     prefix, and a block mask lets each option block see the prefix and itself only -- exactly equivalent to separate
-    forwards, but the state (usually most of the tokens) is computed once."""
+    forwards, but the state (usually most of the tokens) is computed once. A group may hold every branch of a request
+    (SOAM: all questions x option orders over one state); a group whose packed row is longer than the largest shape is
+    bisected into smaller groups, which is still exact (each branch sees the prefix and itself only)."""
 
-    LENS = [128, 192, 256, 320, 384, 448, 512, 640, 768, 1024, 1280, 1536, 2048, 3072]
+    LENS = [128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 3072]
     BATCHES = [1, 2, 4, 8, 16, 32]
     TOKEN_BUDGET = 12288  # max batch x bucket length per forward
 
@@ -82,6 +121,7 @@ class GraphBackend(EagerBackend):
             self.fwd = torch.compile(self._forward, dynamic=True)
             self.fwd_masked = torch.compile(self._forward_masked, dynamic=True)
         self.shared = shared
+        self._wrows = {}
         self.pool = torch.cuda.graph_pool_handle()
         self.graphs = {}
         if warm:
@@ -136,12 +176,27 @@ class GraphBackend(EagerBackend):
         ids = torch.full((b, L), self.tok.pad_token_id, dtype=torch.long, device=self.dev)
         return self._capture(key, self.fwd, ids)
 
-    def _mask_from_seg(self, seg):
-        """seg [b, L]: 0 = shared prefix, k>0 = option block k, -1 = padding -> additive 4D mask [b, 1, L, L]."""
-        L = seg.shape[1]
-        causal = torch.ones(L, L, dtype=torch.bool, device=seg.device).tril()[None]
-        si, sj = seg[:, :, None], seg[:, None, :]
-        allow = causal & (sj >= 0) & ((sj == 0) | (sj == si))
+    def _mask_from_seg(self, seg, parents=None):
+        """seg [b, L]: block id of every token, -1 = padding; parents: per row, the parent block of every block (-1 =
+        root). A token sees earlier tokens of its own block and all tokens of its ancestor blocks (the prefix trie of
+        the prompts), so every readout equals a separate forward of its own prompt. Without parents: block 0 is the
+        shared prefix of all other blocks. -> additive 4D mask [b, 1, L, L]."""
+        b, L = seg.shape
+        if parents is None:
+            nb = int(seg.max()) + 1
+            parents = [[-1] + [0] * (nb - 1)] * b
+        NB = max(map(len, parents)) + 1  # last index: padding, sees nothing
+        anc = np.zeros((b, NB, NB), dtype=bool)
+        for r, par in enumerate(parents):
+            a = anc[r]
+            for k, pk in enumerate(par):  # parents precede children (depth-first order)
+                if pk >= 0:
+                    a[k] = a[pk]
+                a[k, k] = True
+        anc = torch.from_numpy(anc).to(seg.device, non_blocking=True)
+        s = torch.where(seg >= 0, seg, NB - 1)
+        allow = anc[torch.arange(b, device=seg.device)[:, None, None], s[:, :, None], s[:, None, :]]
+        allow &= torch.ones(L, L, dtype=torch.bool, device=seg.device).tril()[None]
         allow |= torch.eye(L, dtype=torch.bool, device=seg.device)[None]
         dt = next(self.model.parameters()).dtype
         return torch.where(allow, 0.0, torch.finfo(dt).min).to(dt)[:, None]
@@ -157,31 +212,59 @@ class GraphBackend(EagerBackend):
 
     @staticmethod
     def _pack(toks):
-        """Token lists of one group -> (ids, positions, segment ids, readout positions)."""
-        P = min(len(t) for t in toks) - 1
-        for k in range(P):
-            if any(t[k] != toks[0][k] for t in toks[1:]):
-                P = k
-                break
-        if len(toks) == 1:
-            P = 0
-        ids, pos, seg, last = list(toks[0][:P]), list(range(P)), [0] * P, []
-        for g, t in enumerate(toks, 1):
-            suf = t[P:]
-            ids += suf; pos += range(P, P + len(suf)); seg += [g] * len(suf)
-            last.append(len(ids) - 1)
-        return ids, pos, seg, last
+        """Token lists of one group -> (ids, positions, block ids, readout positions, block parents): the compressed
+        prefix trie of the prompts, flattened depth-first. Shared prefixes (the state for all questions, a question's
+        text for its option orders) are computed once; positions are each token's index in its own prompt."""
+        import os
+        ids, pos, seg, parent, last = [], [], [], [], [None] * len(toks)
+
+        def build(members, start, par):
+            end = start + len(os.path.commonprefix([toks[m][start:] for m in members]))
+            blk = len(parent)
+            parent.append(par)
+            ids.extend(toks[members[0]][start:end]); pos.extend(range(start, end)); seg.extend([blk] * (end - start))
+            kids = {}
+            for m in members:
+                if len(toks[m]) == end:
+                    last[m] = len(ids) - 1
+                else:
+                    kids.setdefault(toks[m][end], []).append(m)
+            for ms in kids.values():
+                build(ms, end, blk)
+
+        roots = {}
+        for m, tk in enumerate(toks):
+            roots.setdefault(tk[0], []).append(m)
+        for ms in roots.values():
+            build(ms, 0, -1)
+        return ids, pos, seg, last, parent
+
+    def _rows(self, lids):
+        """Answer-row slice of the LM head for the letters in lids, and each readout's column indices (padded, masked).
+        softmax over the letters of the full log-softmax equals softmax over these rows' logits (row-only readout)."""
+        key = tuple(sorted({i for ids in lids for i in ids}))
+        if key not in self._wrows:
+            self._wrows[key] = self.model.lm_head.weight[list(key)].contiguous()
+        col = {t: j for j, t in enumerate(key)}
+        K = max(map(len, lids))
+        idx = torch.tensor([[col[i] for i in ids] + [0] * (K - len(ids)) for ids in lids], device=self.dev)
+        pad = torch.tensor([[False] * len(ids) + [True] * (K - len(ids)) for ids in lids], device=self.dev)
+        return self._wrows[key], idx, pad
+
+    def _letters(self, z, idx, pad, lids):
+        p = torch.softmax(z.float().gather(1, idx).masked_fill(pad, float("-inf")), -1).tolist()  # one device sync
+        return [row[: len(ids)] for row, ids in zip(p, lids)]
 
     def _readout(self, h, lids):
-        lp = torch.log_softmax(self.model.lm_head(h).float(), -1)  # last_hidden_state is already normalised
-        return [torch.softmax(lp[m, lids[m]], -1).tolist() for m in range(len(lids))]
+        W, idx, pad = self._rows(lids)
+        return self._letters(h @ W.T, idx, pad, lids)  # last_hidden_state is already normalised
 
     # -- public calls --------------------------------------------------------------------------------------------
     @torch.no_grad()
     def run(self, prompts, ids_list):
         if self.shared:
             return [r[0] for r in self.run_shared([([p], [x]) for p, x in zip(prompts, ids_list)])]
-        enc = [self.tok(p, add_special_tokens=False).input_ids for p in prompts]
+        enc = self.encode(prompts)
         res = [None] * len(enc)
         for idx in self._chunks([len(e) for e in enc]):
             if len(enc[idx[-1]]) > self.LENS[-1]:  # longer than the largest captured shape: plain forward
@@ -207,45 +290,69 @@ class GraphBackend(EagerBackend):
         h_ids = torch.full((b, L), self.tok.pad_token_id, dtype=torch.long)
         h_pos = torch.arange(L)[None].repeat(b, 1)
         h_seg = torch.full((b, L), -1, dtype=torch.long)
-        rows, cols = [], []
+        rows, cols, parents = [], [], [[] for _ in range(b)]
         for r, k in enumerate(idx):
-            t, pp, sg, last = packs[k]
+            t, pp, sg, last, parents[r] = packs[k]
             h_ids[r, : len(t)] = torch.tensor(t); h_pos[r, : len(t)] = torch.tensor(pp)
             h_seg[r, : len(t)] = torch.tensor(sg)
             rows += [r] * len(last); cols += last
         ids.copy_(h_ids.pin_memory(), non_blocking=True)
         pos.copy_(h_pos.pin_memory(), non_blocking=True)
-        mask.copy_(self._mask_from_seg(h_seg.to(self.dev, non_blocking=True)))
+        mask.copy_(self._mask_from_seg(h_seg.to(self.dev, non_blocking=True), parents))
         return torch.tensor(rows, device=self.dev), torch.tensor(cols, device=self.dev)
 
     def _eager_shared(self, pack, lids):
-        t, pp, sg, last = pack
+        t, pp, sg, last, par = pack
         h = self._forward_masked(torch.tensor([t], device=self.dev),
-                                 self._mask_from_seg(torch.tensor([sg], device=self.dev)),
+                                 self._mask_from_seg(torch.tensor([sg], device=self.dev), [par]),
                                  torch.tensor([pp], device=self.dev))[0, last]
         return self._readout(h, lids)
+
+    def _units(self, groups):
+        """Groups -> packed rows ("units"). A group whose packed row exceeds the largest captured length is bisected
+        (exact: every branch still sees the shared prefix and itself only). Returns [(pack, lids, group, first)]."""
+        units = []
+        for k, (prompts, lids) in enumerate(groups):
+            toks = self.encode(prompts)
+            todo = [(0, len(toks))]
+            while todo:
+                a, b = todo.pop()
+                pk = self._pack(toks[a:b])
+                if len(pk[0]) > self.LENS[-1] and b - a > 1:
+                    m = (a + b) // 2
+                    todo += [(m, b), (a, m)]
+                else:
+                    units.append((pk, lids[a:b], k, a))
+        return units
+
+    @staticmethod
+    def _assemble(groups, units, probs):
+        res = [[None] * len(g[0]) for g in groups]
+        for (pk, lids, k, a), pr in zip(units, probs):
+            res[k][a: a + len(lids)] = pr
+        return res
 
     @torch.no_grad()
     def run_shared(self, groups, policy=None):
         if not self.shared:  # plain graphs captured: one row per option order
             return EagerBackend.run_shared(self, groups)
-        packs = [self._pack([self.tok(p, add_special_tokens=False).input_ids for p in prompts]) for prompts, _ in groups]
-        res = [None] * len(packs)
-        for idx in self._chunks([len(pk[0]) for pk in packs]):
-            if len(packs[idx[-1]][0]) > self.LENS[-1]:
+        units = self._units(groups)
+        probs = [None] * len(units)
+        for idx in self._chunks([len(u[0][0]) for u in units]):
+            if len(units[idx[-1]][0][0]) > self.LENS[-1]:
                 for k in idx:
-                    res[k] = self._eager_shared(packs[k], groups[k][1])
+                    probs[k] = self._eager_shared(units[k][0], units[k][1])
                 continue
-            L = self._bucket(max(len(packs[k][0]) for k in idx), self.LENS)
+            L = self._bucket(max(len(units[k][0][0]) for k in idx), self.LENS)
             b = self._bucket(len(idx), self.BATCHES)
             g, ids, mask, pos, out = self._graph_shared(b, L)
-            ri, ci = self._fill(packs, idx, b, L, ids, mask, pos)
+            ri, ci = self._fill([u[0] for u in units], idx, b, L, ids, mask, pos)
             g.replay()
-            probs = self._readout(out[ri, ci], [x for k in idx for x in groups[k][1]])
+            pr = self._readout(out[ri, ci], [x for k in idx for x in units[k][1]])
             j = 0
             for k in idx:
-                n = len(groups[k][1]); res[k] = probs[j: j + n]; j += n
-        return res
+                n = len(units[k][1]); probs[k] = pr[j: j + n]; j += n
+        return self._assemble(groups, units, probs)
 
 
 class ExitHead(torch.nn.Module):
@@ -348,37 +455,37 @@ class ExitGraphBackend(GraphBackend):
     @torch.no_grad()
     def run_shared(self, groups, policy=None):
         taus = self.policies[policy or self.default_policy]
-        packs = [self._pack([self.tok(p, add_special_tokens=False).input_ids for p in prompts]) for prompts, _ in groups]
-        res = [None] * len(packs)
-        W = self.model.lm_head.weight
-        for idx in self._chunks([len(pk[0]) for pk in packs]):
-            if len(packs[idx[-1]][0]) > self.LENS[-1]:
+        units = self._units(groups)
+        res = [None] * len(units)
+        for idx in self._chunks([len(u[0][0]) for u in units]):
+            if len(units[idx[-1]][0][0]) > self.LENS[-1]:
                 for k in idx:
-                    res[k] = self._eager_shared(packs[k], groups[k][1])
+                    res[k] = self._eager_shared(units[k][0], units[k][1])
                 continue
-            L = self._bucket(max(len(packs[k][0]) for k in idx), self.LENS)
+            L = self._bucket(max(len(units[k][0][0]) for k in idx), self.LENS)
             b = self._bucket(len(idx), self.BATCHES)
             graphs, ids, mask, pos, outs = self._graph_exit(b, L)
-            ri, ci = self._fill(packs, idx, b, L, ids, mask, pos)
-            lids = [x for k in idx for x in groups[k][1]]
+            ri, ci = self._fill([u[0] for u in units], idx, b, L, ids, mask, pos)
+            lids = [x for k in idx for x in units[k][1]]
+            W, cols, pad = self._rows(lids)
             probs, depth = None, self.bounds[-1]
             for s, g in enumerate(graphs):
                 g.replay()
                 if s < len(self.exits) and self.exits[s] in taus:
                     Lx = self.exits[s]
-                    lg = (self.heads[str(Lx)](outs[s][ri, ci]).to(W.dtype) @ W.T).float()
-                    ps = [torch.softmax(lg[m, lids[m]], -1) for m in range(len(lids))]
-                    if min(float(p.max()) for p in ps) >= taus[Lx]:
-                        probs, depth = [p.tolist() for p in ps], Lx
+                    z = self.heads[str(Lx)](outs[s][ri, ci]).to(W.dtype) @ W.T
+                    p = torch.softmax(z.float().gather(1, cols).masked_fill(pad, float("-inf")), -1)
+                    if float(p.max(-1).values.min()) >= taus[Lx]:
+                        probs, depth = [row[: len(x)] for row, x in zip(p.tolist(), lids)], Lx
                         break
             if probs is None:
-                probs = self._readout(outs[-1][ri, ci], lids)
+                probs = self._letters(outs[-1][ri, ci] @ W.T, cols, pad, lids)
             key = (policy or self.default_policy, depth)
             self.stats[key] = self.stats.get(key, 0) + len(idx)
             j = 0
             for k in idx:
-                n = len(groups[k][1]); res[k] = probs[j: j + n]; j += n
-        return res
+                n = len(units[k][1]); res[k] = probs[j: j + n]; j += n
+        return self._assemble(groups, units, res)
 
 
 class VLLMBackend:
@@ -397,7 +504,7 @@ class VLLMBackend:
     def run(self, prompts, ids_list):
         from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
-        reqs = [TokensPrompt(prompt_token_ids=self.tok(p, add_special_tokens=False).input_ids) for p in prompts]
+        reqs = [TokensPrompt(prompt_token_ids=list(ids)) for ids in EagerBackend.encode(self, prompts)]
         sps = [SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(ids), allowed_token_ids=list(ids))
                for ids in ids_list]
         res = []
@@ -413,6 +520,309 @@ class VLLMBackend:
         for g in groups:
             out.append(flat[j: j + len(g[0])]); j += len(g[0])
         return out
+
+
+class SGLangBackend:
+    """SGLang offline engine (1.5). One generated token; the engine returns the log-probabilities of the option letters
+    at the answer position (`token_ids_logprob`), and the softmax over them equals the readout of the other backends
+    (a softmax over a subset of log-softmax values is the softmax over the same logits). RadixAttention shares the
+    state between the option orders of one question and between the questions of one request."""
+
+    def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096):
+        import sglang
+        self.tok = AutoTokenizer.from_pretrained(model_dir)
+        self.prefill = PREFILL
+        self.llm = sglang.Engine(model_path=str(model_dir), dtype=dtype, mem_fraction_static=mem,
+                                 context_length=max_len, log_level="error")
+
+    @staticmethod
+    def _letters(meta, ids):
+        """meta_info["output_token_ids_logprobs"][0] -> logprob per requested id ((logprob, token_id, text) tuples)."""
+        got = {int(x[1]): float(x[0]) for x in meta["output_token_ids_logprobs"][0]}
+        return [got.get(i, -1e9) for i in ids]
+
+    def run(self, prompts, ids_list):
+        enc = [list(ids) for ids in EagerBackend.encode(self, prompts)]
+        outs = self.llm.generate(input_ids=enc, sampling_params=[{"max_new_tokens": 1, "temperature": 0.0}] * len(enc),
+                                 return_logprob=True, logprob_start_len=-1,
+                                 token_ids_logprob=[list(ids) for ids in ids_list])
+        return [torch.softmax(torch.tensor(self._letters(o["meta_info"], ids), dtype=torch.float32), -1).tolist()
+                for o, ids in zip(outs, ids_list)]
+
+    def run_shared(self, groups, policy=None):
+        flat = self.run([p for g in groups for p in g[0]], [x for g in groups for x in g[1]])
+        out, j = [], 0
+        for g in groups:
+            out.append(flat[j: j + len(g[0])]); j += len(g[0])
+        return out
+
+
+def _split(flat, groups):
+    out, j = [], 0
+    for g in groups:
+        out.append(flat[j: j + len(g[0])]); j += len(g[0])
+    return out
+
+
+def mlx_config_overrides(cfg):
+    """transformers 5 writes the rotary settings as `rope_parameters`; mlx-lm reads `rope_theta` / `rope_scaling` only
+    (without this override it silently uses rope_theta = 10000)."""
+    rp = cfg.get("rope_parameters") or {}
+    out = {}
+    if "rope_theta" not in cfg and "rope_theta" in rp:
+        out["rope_theta"] = rp["rope_theta"]
+    if not cfg.get("rope_scaling") and rp.get("rope_type", "default") != "default":
+        out["rope_scaling"] = {k: v for k, v in rp.items() if k != "rope_theta"}
+    return out
+
+
+class MLXBackend:
+    """Apple Silicon (MLX / mlx-lm): the MLX exports (the -MLX-8bit / -MLX-fp4 repositories) or a bf16 Hugging Face
+    directory. Same prompts, tokens and letter readout as the PyTorch backends. The shared prefix of a group (both
+    option orders of a question; with SOAM every question and order of a request, i.e. the state) is computed once into
+    a KV cache, and the remaining suffixes run as one right-padded batch continuing that cache: a suffix sees the
+    prefix and its own earlier tokens only, so every readout equals a separate forward of its prompt. All MLX work
+    runs on one dedicated thread (the server calls the backend from an executor)."""
+
+    MAX_ROWS = 16      # suffix rows per forward
+    TOKEN_BUDGET = 8192  # rows x padded length per forward without a shared prefix
+    CACHE_BYTES = 2 << 30  # MLX buffer cache limit (and wired headroom above the weights)
+
+    def __init__(self, model_dir, max_rows=None):
+        from concurrent.futures import ThreadPoolExecutor
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
+        self.tok = AutoTokenizer.from_pretrained(model_dir)
+        self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
+        self.prefill = PREFILL
+        self.max_rows = max_rows or self.MAX_ROWS
+        self.pool.submit(self._load, Path(model_dir)).result()
+
+    def _load(self, md):
+        import mlx.core as mx
+        from mlx_lm.utils import load_model
+        self.mx = mx
+        cfg = json.loads((md / "config.json").read_text())
+        self.model, self.config = load_model(md, model_config=mlx_config_overrides(cfg))
+        self.quantization = self.config.get("quantization")
+        # keep the weights resident (wired: under memory pressure macOS would page them out and every forward would
+        # wait for them) and the buffer cache small (by default it grows towards the whole working set, one entry per
+        # new shape, and on a 16-24 GB Mac pushes everything else into swap)
+        from mlx.utils import tree_flatten
+        weights = sum(v.nbytes for _, v in tree_flatten(self.model.parameters()))
+        if mx.metal.is_available():
+            rec = mx.device_info().get("max_recommended_working_set_size", weights)
+            mx.set_wired_limit(min(rec, weights + self.CACHE_BYTES))
+        mx.set_cache_limit(self.CACHE_BYTES)
+
+    def encode(self, prompts):
+        return EagerBackend.encode(self, prompts)
+
+    def _head(self, h):
+        m = self.model
+        return m.model.embed_tokens.as_linear(h) if m.args.tie_word_embeddings else m.lm_head(h)
+
+    def _letters(self, h, lids):
+        """Hidden states [n, d] at the readout positions -> softmax over each readout's letters (float32)."""
+        mx = self.mx
+        z = self._head(h).astype(mx.float32)
+        K = max(map(len, lids))
+        idx = mx.array([list(ids) + [ids[0]] * (K - len(ids)) for ids in lids])
+        pad = mx.array([[False] * len(ids) + [True] * (K - len(ids)) for ids in lids])
+        z = mx.where(pad, -mx.inf, mx.take_along_axis(z, idx, axis=1))
+        p = mx.softmax(z, axis=-1).tolist()
+        return [row[: len(ids)] for row, ids in zip(p, lids)]
+
+    def _forward(self, rows, prefix=None):
+        """Token rows (right-padded into one batch) -> hidden state at each row's last token. `prefix`: per-layer
+        (keys, values) of a shared prefix that every row continues (positions start after it)."""
+        mx = self.mx
+        from mlx_lm.models.cache import KVCache
+        B, S = len(rows), max(map(len, rows))
+        pad = self.tok.pad_token_id
+        ids = mx.array([list(r) + [pad] * (S - len(r)) for r in rows])
+        cache = None
+        if prefix is not None:
+            cache = []
+            for k, v in prefix:
+                c = KVCache()
+                c.keys, c.values, c.offset = mx.repeat(k, B, axis=0), mx.repeat(v, B, axis=0), k.shape[2]
+                cache.append(c)
+        h = self.model.model(ids, cache=cache)
+        return h[mx.arange(B), mx.array([len(r) - 1 for r in rows])]
+
+    def _prefix(self, toks):
+        mx = self.mx
+        from mlx_lm.models.cache import make_prompt_cache
+        cache = make_prompt_cache(self.model)
+        self.model.model(mx.array([toks]), cache=cache)
+        kv = [(c.keys[..., : c.offset, :], c.values[..., : c.offset, :]) for c in cache]
+        mx.eval(kv)
+        return kv
+
+    def _group(self, toks, lids):
+        """One group: shared prefix once, then the suffixes in batches of max_rows."""
+        import os
+        P = min(len(os.path.commonprefix(toks)), min(map(len, toks)) - 1)
+        prefix = self._prefix(toks[0][:P]) if P > 0 else None
+        out = []
+        for i in range(0, len(toks), self.max_rows):
+            h = self._forward([t[P:] for t in toks[i: i + self.max_rows]], prefix)
+            out += self._letters(h, lids[i: i + self.max_rows])
+        return out
+
+    def _singles(self, toks, lids):
+        """Unrelated prompts: right-padded batches of similar length, no cache."""
+        chunks, cur = [], []
+        for k in sorted(range(len(toks)), key=lambda k: len(toks[k])):
+            if cur and (len(cur) >= self.max_rows or (len(cur) + 1) * len(toks[k]) > self.TOKEN_BUDGET):
+                chunks.append(cur); cur = []
+            cur.append(k)
+        res = [None] * len(toks)
+        for c in chunks + [cur]:
+            for j, p in zip(c, self._letters(self._forward([toks[j] for j in c]), [lids[j] for j in c])):
+                res[j] = p
+        return res
+
+    def _run_shared(self, groups):
+        enc = [(self.encode(p), x) for p, x in groups]
+        out = [None] * len(groups)
+        single = [k for k, (t, _) in enumerate(enc) if len(t) == 1]
+        if single:
+            for k, p in zip(single, self._singles([enc[k][0][0] for k in single], [enc[k][1][0] for k in single])):
+                out[k] = [p]
+        for k, (t, x) in enumerate(enc):
+            if out[k] is None:
+                out[k] = self._group(t, x)
+        return out
+
+    def run_shared(self, groups, policy=None):
+        return self.pool.submit(self._run_shared, groups).result()
+
+    def run(self, prompts, ids_list):
+        return [r[0] for r in self.run_shared([([p], [x]) for p, x in zip(prompts, ids_list)])]
+
+
+class _HTTPLetters:
+    """Shared part of the HTTP backends (Ollama, llama.cpp server): one request per prompt (one generated token with
+    the top log-probabilities at the answer position), sent sequentially so that the engine's prompt cache reuses the
+    state between the option orders and the questions of a request; `parallel` > 1 sends that many at once (for an
+    engine started with several slots / OLLAMA_NUM_PARALLEL)."""
+
+    TOP = 20  # top log-probabilities requested; the option letters dominate the answer position
+    RETRIES = 3  # dropped connections retried per request
+
+    def __init__(self, model_dir, url, parallel=1, timeout=120.0):
+        import httpx
+        self.tok = AutoTokenizer.from_pretrained(model_dir)
+        self.prefill = PREFILL
+        self.http = httpx.Client(base_url=url.rstrip("/"), timeout=timeout)
+        self.parallel = parallel
+        self.pool = None
+        if parallel > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            self.pool = ThreadPoolExecutor(max_workers=parallel)
+
+    def _post(self, path, body):
+        """POST with a few retries on dropped connections (an engine restarting or closing an idle keep-alive)."""
+        import time
+
+        import httpx
+        for k in range(self.RETRIES + 1):
+            try:
+                r = self.http.post(path, json=body)
+                r.raise_for_status()
+                return r.json()
+            except httpx.TransportError:  # connection refused / reset, server disconnected
+                if k == self.RETRIES:
+                    raise
+                time.sleep(0.5 * 2 ** k)
+
+    def run(self, prompts, ids_list):
+        jobs = list(zip(prompts, ids_list))
+        lps = list(self.pool.map(lambda j: self._one(*j), jobs)) if self.pool else [self._one(*j) for j in jobs]
+        return [torch.softmax(torch.tensor(x, dtype=torch.float32), -1).tolist() for x in lps]
+
+    def run_shared(self, groups, policy=None):
+        return _split(self.run([p for g in groups for p in g[0]], [x for g in groups for x in g[1]]), groups)
+
+    def close(self):
+        self.http.close()
+
+
+class OllamaBackend(_HTTPLetters):
+    """Ollama (GGUF exports: the -GGUF repositories; Apple Silicon, CPU, CUDA). The prompt is rendered and
+    calibrated here (the model directory gives the tokenizer, chat template and CALIBRATION.json) and sent as a raw
+    prompt (`raw: true`: no Ollama template) to /api/generate with one generated token and `logprobs` /
+    `top_logprobs`; Ollama tokenizes it with the GGUF vocabulary. Letters missing from the top list get -1e9 (their
+    log-probability is below the TOP-th token, i.e. practically zero next to the letters that are listed)."""
+
+    takes_text = True  # Ollama accepts text only; the server skips its own tokenization
+
+    def __init__(self, model_dir, url="http://127.0.0.1:11434", model=None, parallel=1, num_ctx=4096, keep_alive="30m"):
+        super().__init__(model_dir, url, parallel)
+        if not model:
+            raise ValueError("--ollama-model is required for --mode ollama")
+        self.name, self.num_ctx, self.keep_alive = model, num_ctx, keep_alive
+        self.letter_text = {}
+        self.checked = False
+
+    def _raw(self, prompt):
+        """The rendered prompt starts with the BOS text; the GGUF exports set add_bos_token, so Ollama adds BOS itself
+        (sending it as text too would give two)."""
+        bos = self.tok.bos_token
+        return prompt[len(bos):] if bos and prompt.startswith(bos) else prompt
+
+    def _text(self, i):
+        if i not in self.letter_text:
+            self.letter_text[i] = self.tok.decode([i])
+        return self.letter_text[i]
+
+    def body(self, prompt):
+        return {"model": self.name, "prompt": prompt, "raw": True, "stream": False, "logprobs": True,
+                "top_logprobs": self.TOP, "keep_alive": self.keep_alive,
+                "options": {"num_predict": 1, "temperature": 0, "num_ctx": self.num_ctx}}
+
+    @staticmethod
+    def parse(resp, letters):
+        """/api/generate response -> log-probability of each letter text at the first generated position."""
+        first = resp["logprobs"][0]
+        got = {x["token"]: float(x["logprob"]) for x in first.get("top_logprobs") or []}
+        got.setdefault(first["token"], float(first["logprob"]))
+        return [got.get(t, -1e9) for t in letters]
+
+    def _one(self, prompt, ids):
+        if not isinstance(prompt, str):
+            prompt = self.tok.decode(prompt)
+        out = self._post("/api/generate", self.body(self._raw(prompt)))
+        if not self.checked:  # first request: Ollama's token count must equal ours (same tokenizer, one BOS)
+            self.checked = True
+            n, got = len(self.tok(prompt, add_special_tokens=False).input_ids), out.get("prompt_eval_count")
+            if got is not None and got != n:
+                import warnings
+                warnings.warn(f"Ollama evaluated {got} prompt tokens, the basal tokenizer gives {n}: the GGUF vocabulary "
+                              "differs from the model's tokenizer (use the GGUF files of the -GGUF repositories)")
+        return self.parse(out, [self._text(i) for i in ids])
+
+
+class LlamaCppBackend(_HTTPLetters):
+    """llama.cpp server (`llama-server -m model.gguf`): the same readout from /completion with the prompt given as
+    token ids (exactly the server's tokens) and `n_probs`; the log-probabilities are those of the raw logits
+    (`post_sampling_probs` off). The prompt cache (`cache_prompt`) shares the state between requests of one slot."""
+
+    def body(self, ids):
+        return {"prompt": list(ids), "n_predict": 1, "n_probs": self.TOP, "temperature": 0.0, "cache_prompt": True,
+                "post_sampling_probs": False, "return_tokens": False}
+
+    @staticmethod
+    def parse(resp, ids):
+        first = resp["completion_probabilities"][0]
+        got = {int(x["id"]): float(x["logprob"]) for x in first.get("top_logprobs") or []}
+        got.setdefault(int(first["id"]), float(first["logprob"]))
+        return [got.get(int(i), -1e9) for i in ids]
+
+    def _one(self, prompt, ids):
+        toks = prompt if not isinstance(prompt, str) else self.tok(prompt, add_special_tokens=False).input_ids
+        return self.parse(self._post("/completion", self.body(toks)), ids)
 
 
 def quantize(model, quant):

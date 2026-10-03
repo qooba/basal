@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "basal"
-version = "1.0.0"
-description = "Inference engine for basal-1.0: fast, calibrated typed decisions (choice / yes-no / score) for Polish and English"
+version = "1.5.0"
+description = "Inference engine for basal: fast, calibrated typed decisions (choice / yes-no / score) for Polish and English"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
@@ -24,6 +24,7 @@ dependencies = [
 fp8 = ["torchao==0.18.0"]
 nvfp4 = ["torchao==0.18.0"]
 vllm = ["vllm>=0.11"]
+mlx = ["mlx>=0.32; python_version >= '3.11'", "mlx-lm>=0.32; python_version >= '3.11'"]  # Apple Silicon: --mode mlx (-MLX-8bit / -MLX-fp4 exports); mlx-lm needs Python 3.11+
 test = ["pytest", "jsonschema"]
 
 [project.scripts]
