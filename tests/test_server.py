@@ -2,13 +2,16 @@
 list conform to the official System One OpenAPI schema (tests/data/systemone_openapi.json)."""
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import jsonschema
 import pytest
 
+import basal.bench as bench_module
+import basal.server as server_module
 from basal.facts import HEADER, facts, inject
-from basal.server import Server, models_payload, named_options, parser, to_items
+from basal.server import Server, default_mode, models_payload, named_options, parser, to_items
 
 SPEC = json.loads((Path(__file__).parent / "data/systemone_openapi.json").read_text())
 
@@ -57,6 +60,69 @@ def _probs_for(self, prompt, ids):
 
 
 FakeServer.probs_for = _probs_for
+
+
+def test_default_mode_prefers_cuda_over_mlx(monkeypatch):
+    monkeypatch.setattr(server_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(server_module.torch.backends.mps, "is_available", lambda: True)
+    assert default_mode() == "fast"
+
+
+def test_default_mode_requires_both_mlx_packages_on_mps(monkeypatch):
+    monkeypatch.setattr(server_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(server_module.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setitem(sys.modules, "mlx_lm", None)
+    assert default_mode() == "mps"
+
+
+def test_benchmark_mps_default_avoids_eager_fp32(monkeypatch):
+    monkeypatch.setattr(bench_module, "default_mode", lambda: "mlx")
+    monkeypatch.setattr(bench_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(bench_module.torch.backends.mps, "is_available", lambda: True)
+    assert bench_module.default_modes() == ["mps", "mlx"]
+
+
+def test_benchmark_cuda_default_preserves_fp32_reference(monkeypatch):
+    monkeypatch.setattr(bench_module, "default_mode", lambda: "fast")
+    monkeypatch.setattr(bench_module.torch.cuda, "is_available", lambda: True)
+    assert bench_module.default_modes() == ["eager-fp32", "fast"]
+
+
+def test_benchmark_sync_and_memory_follow_backend_device(monkeypatch):
+    import math
+    from types import SimpleNamespace
+
+    calls = []
+    monkeypatch.setattr(bench_module.torch.mps, "synchronize", lambda: calls.append("mps"))
+    monkeypatch.setattr(bench_module.torch.mps, "driver_allocated_memory", lambda: 2**30)
+    cpu = SimpleNamespace(dev="cpu")
+    mps = SimpleNamespace(dev=bench_module.torch.device("mps"))
+    bench_module.timed(lambda: calls.append("work"), 1, cpu)
+    assert calls == ["work"]
+    assert math.isnan(bench_module.memory_gb(cpu))
+
+    calls.clear()
+    bench_module.timed(lambda: calls.append("work"), 1, mps)
+    assert calls == ["mps", "work", "mps"]
+    assert bench_module.memory_gb(mps) == 1.0
+
+
+@pytest.mark.parametrize(("mode", "quant"), [
+    ("eager", "fp8"), ("fast", "q8"), ("mps", "fp8"), ("mlx", "nvfp4"), ("vllm", "fp8"), ("gguf", "q8"),
+    ("mlx", "fp8"), ("mps", "q8"), ("eager", "nvfp4"), ("sglang", "fp8"), ("ollama", "q8"),
+])
+def test_unsupported_quant_fails_before_model_loading(monkeypatch, mode, quant):
+    monkeypatch.setattr(sys, "argv", ["basal-serve", "--mode", mode, "--quant", quant])
+    monkeypatch.setattr(server_module, "resolve", lambda *_, **__: pytest.fail("must reject before loading a model"))
+    with pytest.raises(SystemExit, match="not supported"):
+        server_module.main()
+
+
+def test_gguf_mode_needs_a_file_before_model_loading(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["basal-serve", "--mode", "gguf"])
+    monkeypatch.setattr(server_module, "resolve", lambda *_, **__: pytest.fail("must reject before loading a model"))
+    with pytest.raises(SystemExit, match="--gguf"):
+        server_module.main()
 
 
 def test_named_options_show_keys_by_default():

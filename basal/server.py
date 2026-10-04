@@ -26,8 +26,8 @@ from pathlib import Path
 
 import torch
 
-from .engine import (EagerBackend, ExitGraphBackend, GraphBackend, LlamaCppBackend, MLXBackend, OllamaBackend,
-                     SGLangBackend, VLLMBackend, resolve)
+from .engine import (EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
+                     MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve)
 from .evidence import Evidence
 from .facts import inject as inject_facts
 from .prompt import MAX_OPTIONS, lang_of, letter_ids, render
@@ -36,7 +36,7 @@ RELEASE_DATE = "2026-10-05"  # the engine's release date (GET /v1/models), not t
 
 MODES = {
     # mode: (backend, quantisation, compile)
-    "eager": ("eager", None, False),        # reference PyTorch forward, any GPU (or CPU)
+    "eager": ("eager", None, False),        # reference PyTorch forward, any GPU (CUDA, Apple MPS) or CPU
     "fast": ("graph", None, True),          # bf16 + torch.compile + CUDA graphs + shared prefix (recommended)
     "fast-nocompile": ("graph", None, False),  # same without torch.compile (faster start-up, ~1.4x slower on H100)
     "fast-exit": ("exit", None, True),      # "fast" + trained early exits, policy chosen per request
@@ -45,9 +45,37 @@ MODES = {
     "vllm": ("vllm", None, False),          # vLLM, for the ModelOpt FP8 / NVFP4 checkpoints
     "sglang": ("sglang", None, False),      # SGLang offline engine (1.5)
     "mlx": ("mlx", None, False),            # Apple Silicon, MLX (1.5): the MLX fp8 / fp4 exports or bf16 weights
+    "mlx-q8": ("mlx", "q8", False),         # "mlx" with 8-bit weights made at load time (less memory, not faster)
+    "mps": ("mps", None, False),            # Apple Silicon: PyTorch MPS + shared prefix, no graphs
+    "gguf": ("gguf", None, False),          # llama.cpp in process on a GGUF file (--gguf; Metal, CUDA or CPU)
     "ollama": ("ollama", None, False),      # Ollama with the GGUF exports (1.5); --ollama-url, --ollama-model
     "llamacpp": ("llamacpp", None, False),  # llama.cpp server with the GGUF exports (1.5); --llamacpp-url
 }
+
+
+def default_mode():
+    """fast on CUDA, mlx on Apple Silicon when mlx and mlx-lm are installed, mps otherwise there, else eager."""
+    if torch.cuda.is_available():
+        return "fast"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        try:
+            import mlx.core  # noqa: F401
+            import mlx_lm  # noqa: F401
+            return "mlx"
+        except ImportError:
+            return "mps"
+    return "eager"
+
+
+def validate_quant(mode, quant):
+    """Reject quantisation overrides that the selected backend cannot apply (before any model is loaded)."""
+    if quant is None:
+        return
+    kind = MODES[mode][0]
+    if quant == "q8" and kind == "mlx" or quant in ("fp8", "nvfp4") and kind in ("graph", "exit"):
+        return
+    raise SystemExit(f"--quant {quant} is not supported with --mode {mode} "
+                     "(q8 only for mlx; fp8 and nvfp4 only for the CUDA graph modes)")
 
 
 def _text(x):
@@ -200,8 +228,12 @@ def models_payload(name, mode, policies):
 
 class Server:
     def __init__(self, a):
+        validate_quant(a.mode, a.quant)
         kind, quant, comp = MODES[a.mode]
-        md = resolve(a.model, a.revision, metadata_only=kind in ("ollama", "llamacpp"))  # GGUF repos: skip the weights
+        if kind == "gguf" and not a.gguf:
+            raise SystemExit("--mode gguf needs --gguf <file.gguf> (--model gives tokenizer and calibration)")
+        # GGUF modes: the engine serves the GGUF weights, so only tokenizer, template and calibration are downloaded
+        md = resolve(a.model, a.revision, metadata_only=kind in ("gguf", "ollama", "llamacpp"))
         self.name = a.name or a.model.rstrip("/").split("/")[-1]
         quant = a.quant or quant
         if kind == "eager":
@@ -214,7 +246,11 @@ class Server:
         elif kind == "sglang":
             self.backend = SGLangBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len)
         elif kind == "mlx":
-            self.backend = MLXBackend(md)
+            self.backend = MLXBackend(md, quant=quant)
+        elif kind == "mps":
+            self.backend = MPSBackend(md, a.dtype, shared=a.orders == 2)
+        elif kind == "gguf":
+            self.backend = GGUFBackend(md, a.gguf)
         elif kind == "ollama":
             self.backend = OllamaBackend(md, a.ollama_url, a.ollama_model, parallel=a.http_parallel)
         elif kind == "llamacpp":
@@ -390,8 +426,10 @@ def parser():
     ap.add_argument("--model", default="Remek/basal-1.5-4.5B", help="local directory or Hugging Face repo id")
     ap.add_argument("--revision", default=None)
     ap.add_argument("--name", default=None, help="model name reported in responses (default: last part of --model)")
-    ap.add_argument("--mode", choices=list(MODES), default="fast")
-    ap.add_argument("--quant", choices=["fp8", "nvfp4"], default=None, help="override the quantisation of the mode")
+    ap.add_argument("--mode", choices=list(MODES), default=None,
+                    help="default: fast on CUDA, mlx on Apple Silicon (mps without mlx / mlx-lm), eager otherwise")
+    ap.add_argument("--quant", choices=["fp8", "nvfp4", "q8"], default=None,
+                    help="override the quantisation of the mode (fp8 / nvfp4: CUDA graph modes, q8: mlx)")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--device", default=None, choices=["cuda", "mps", "cpu"],
                     help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu)")
@@ -408,6 +446,7 @@ def parser():
     ap.add_argument("--gpu-memory", dest="gpu_memory", type=float, default=0.6, help="vLLM memory fraction")
     ap.add_argument("--max-len", dest="max_len", type=int, default=4096,
                     help="--mode vllm / sglang: context length in tokens (longer states are refused; raise it for long documents)")
+    ap.add_argument("--gguf", default=None, help="--mode gguf: GGUF weights (a -GGUF file or one converted from --model)")
     ap.add_argument("--ollama-url", dest="ollama_url", default="http://127.0.0.1:11434", help="--mode ollama")
     ap.add_argument("--ollama-model", dest="ollama_model", default=None,
                     help="--mode ollama: Ollama model name (the -GGUF repositories); --model gives the tokenizer")
@@ -424,6 +463,8 @@ def parser():
 
 def main():
     a = parser().parse_args()
+    a.mode = a.mode or default_mode()
+    validate_quant(a.mode, a.quant)
     from contextlib import asynccontextmanager
 
     import uvicorn

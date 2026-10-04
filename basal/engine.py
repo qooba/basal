@@ -7,13 +7,17 @@
 A prompt is a string or a list of token ids (the server tokenizes once and passes ids).
 
 Backends:
-  EagerBackend      plain PyTorch forward (reference, any GPU or CPU)
+  EagerBackend      plain PyTorch forward (reference, any GPU, Apple MPS or CPU)
   GraphBackend      static shapes + CUDA graphs, optional torch.compile, shared prefix for the two option orders,
                     token-budget batching, optional torchao FP8 / NVFP4 quantisation
   ExitGraphBackend  GraphBackend split into graph segments at trained early-exit layers; exit policy per request
+  MPSBackend        GraphBackend's shared prefix + token-budget batching on Apple MPS (PyTorch, no graphs)
   VLLMBackend       vLLM, for ModelOpt FP8 / NVFP4 checkpoints (native low-precision kernels)
   SGLangBackend     SGLang offline engine (1.5): the same letter readout from the log-probabilities of the option tokens
-  MLXBackend        Apple Silicon, MLX / mlx-lm (1.5): MLX fp8 / fp4 exports or bf16 weights; shared-prefix KV cache
+  MLXBackend        Apple Silicon, MLX / mlx-lm (1.5): MLX fp8 / fp4 exports or bf16 weights (optional 8-bit at load
+                    time); shared-prefix KV cache
+  GGUFBackend       a GGUF file in process through llama.cpp (llama-cpp-python; Metal, CUDA or CPU); shared prefix as
+                    llama.cpp sequences
   OllamaBackend     Ollama with the GGUF exports (1.5): raw prompt, one token, top log-probabilities of the letters
   LlamaCppBackend   llama.cpp server with the GGUF exports (1.5): token-id prompt, `n_probs` log-probabilities
 """
@@ -286,7 +290,9 @@ class GraphBackend(EagerBackend):
                 res[r] = p
         return res
 
-    def _fill(self, packs, idx, b, L, ids, mask, pos):
+    def _host_rows(self, packs, idx, b, L):
+        """Packed rows -> padded host tensors ids / positions / block ids [b, L], readout rows and columns, and the
+        block parents of every row."""
         h_ids = torch.full((b, L), self.tok.pad_token_id, dtype=torch.long)
         h_pos = torch.arange(L)[None].repeat(b, 1)
         h_seg = torch.full((b, L), -1, dtype=torch.long)
@@ -296,6 +302,10 @@ class GraphBackend(EagerBackend):
             h_ids[r, : len(t)] = torch.tensor(t); h_pos[r, : len(t)] = torch.tensor(pp)
             h_seg[r, : len(t)] = torch.tensor(sg)
             rows += [r] * len(last); cols += last
+        return h_ids, h_pos, h_seg, rows, cols, parents
+
+    def _fill(self, packs, idx, b, L, ids, mask, pos):
+        h_ids, h_pos, h_seg, rows, cols, parents = self._host_rows(packs, idx, b, L)
         ids.copy_(h_ids.pin_memory(), non_blocking=True)
         pos.copy_(h_pos.pin_memory(), non_blocking=True)
         mask.copy_(self._mask_from_seg(h_seg.to(self.dev, non_blocking=True), parents))
@@ -308,6 +318,10 @@ class GraphBackend(EagerBackend):
                                  torch.tensor([pp], device=self.dev))[0, last]
         return self._readout(h, lids)
 
+    def _oversize(self, pack, n):
+        """A packed row of n readouts that must be split: longer than the largest captured length."""
+        return len(pack[0]) > self.LENS[-1]
+
     def _units(self, groups):
         """Groups -> packed rows ("units"). A group whose packed row exceeds the largest captured length is bisected
         (exact: every branch still sees the shared prefix and itself only). Returns [(pack, lids, group, first)]."""
@@ -318,7 +332,7 @@ class GraphBackend(EagerBackend):
             while todo:
                 a, b = todo.pop()
                 pk = self._pack(toks[a:b])
-                if len(pk[0]) > self.LENS[-1] and b - a > 1:
+                if self._oversize(pk, b - a) and b - a > 1:
                     m = (a + b) // 2
                     todo += [(m, b), (a, m)]
                 else:
@@ -488,11 +502,50 @@ class ExitGraphBackend(GraphBackend):
         return self._assemble(groups, units, res)
 
 
+class MPSBackend(GraphBackend):
+    """Apple GPU through PyTorch MPS: the shared-prefix packing (prefix trie, SOAM) and token-budget batching of
+    GraphBackend, run as plain forwards (MPS has no CUDA graphs). Rows are padded on the right to the longest packed
+    row of the chunk."""
+
+    def __init__(self, model_dir, dtype="bfloat16", shared=True, device="mps"):
+        EagerBackend.__init__(self, model_dir, dtype, device)
+        self.dev = torch.device(device)
+        self.shared = shared
+        self._wrows = {}
+
+    @torch.no_grad()
+    def run(self, prompts, ids_list):
+        if not self.shared:
+            return EagerBackend.run(self, prompts, ids_list)
+        return [r[0] for r in self.run_shared([([p], [x]) for p, x in zip(prompts, ids_list)])]
+
+    @torch.no_grad()
+    def run_shared(self, groups, policy=None):
+        if not self.shared:
+            return EagerBackend.run_shared(self, groups)
+        units = self._units(groups)
+        probs = [None] * len(units)
+        for idx in self._chunks([len(u[0][0]) for u in units]):
+            if len(units[idx[-1]][0][0]) > self.LENS[-1]:
+                for k in idx:
+                    probs[k] = self._eager_shared(units[k][0], units[k][1])
+                continue
+            L = max(len(units[k][0][0]) for k in idx)
+            ids, pos, seg, rows, cols, parents = self._host_rows([u[0] for u in units], idx, len(idx), L)
+            h = self._forward_masked(ids.to(self.dev), self._mask_from_seg(seg.to(self.dev), parents), pos.to(self.dev))
+            pr = self._readout(h[rows, cols], [x for k in idx for x in units[k][1]])
+            j = 0
+            for k in idx:
+                n = len(units[k][1]); probs[k] = pr[j: j + n]; j += n
+        return self._assemble(groups, units, probs)
+
+
 class VLLMBackend:
     """vLLM backend for ModelOpt FP8 / NVFP4 checkpoints. One generated token restricted to the option letters; with
     logprobs_mode="processed_logprobs" the log-probabilities are computed after that restriction, so the softmax over
-    the letters equals the readout of the other backends. vLLM's automatic prefix caching shares the state between the
-    two option orders."""
+    the letters equals the readout of the other backends. Where vLLM supports it, logprob_token_ids asks for exactly
+    the letter ids: vllm-metal ignores the logprobs mode and returns the top-k of the unrestricted vocabulary, which
+    can miss a letter. vLLM's automatic prefix caching shares the state between the two option orders."""
 
     def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096):
         from vllm import LLM
@@ -505,7 +558,10 @@ class VLLMBackend:
         from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
         reqs = [TokensPrompt(prompt_token_ids=list(ids)) for ids in EagerBackend.encode(self, prompts)]
-        sps = [SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(ids), allowed_token_ids=list(ids))
+        import inspect
+        exact = "logprob_token_ids" in inspect.signature(SamplingParams).parameters
+        sps = [SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(ids), allowed_token_ids=list(ids),
+                              **(dict(logprob_token_ids=list(ids)) if exact else {}))
                for ids in ids_list]
         res = []
         for o, ids in zip(self.llm.generate(reqs, sps, use_tqdm=False), ids_list):
@@ -588,22 +644,35 @@ class MLXBackend:
     TOKEN_BUDGET = 8192  # rows x padded length per forward without a shared prefix
     CACHE_BYTES = 2 << 30  # MLX buffer cache limit (and wired headroom above the weights)
 
-    def __init__(self, model_dir, max_rows=None):
+    def __init__(self, model_dir, max_rows=None, quant=None):
         from concurrent.futures import ThreadPoolExecutor
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
         self.prefill = PREFILL
         self.max_rows = max_rows or self.MAX_ROWS
-        self.pool.submit(self._load, Path(model_dir)).result()
+        self.pool.submit(self._load, Path(model_dir), quant).result()
 
-    def _load(self, md):
+    def _load(self, md, quant=None):
+        """quant: None, or "q8": MLX affine 8-bit weights (group size 64) of the decoder blocks' linear layers, made at
+        load time from bf16 weights (the embeddings and the LM head stay bf16); the -MLX-8bit exports need no quant."""
         import mlx.core as mx
         from mlx_lm.utils import load_model
         self.mx = mx
         cfg = json.loads((md / "config.json").read_text())
-        self.model, self.config = load_model(md, model_config=mlx_config_overrides(cfg))
+        if quant not in (None, "q8"):
+            raise ValueError(f"unknown MLX quantisation {quant!r} (q8)")
+        # lazy for q8: the weights are materialised once, after quantisation (never the full bf16 copy)
+        self.model, self.config = load_model(md, lazy=bool(quant), model_config=mlx_config_overrides(cfg))
         self.quantization = self.config.get("quantization")
+        if quant:
+            if self.quantization:
+                raise ValueError(f"{md} is already quantised ({self.quantization}); use it without --quant")
+            import mlx.nn as nn
+            nn.quantize(self.model, group_size=64, bits=8,
+                        class_predicate=lambda path, m: isinstance(m, nn.Linear) and path.startswith("model.layers."))
+            mx.eval(self.model.parameters())
+            self.quantization = {"group_size": 64, "bits": 8}
         # keep the weights resident (wired: under memory pressure macOS would page them out and every forward would
         # wait for them) and the buffer cache small (by default it grows towards the whole working set, one entry per
         # new shape, and on a 16-24 GB Mac pushes everything else into swap)
@@ -700,6 +769,137 @@ class MLXBackend:
 
     def run(self, prompts, ids_list):
         return [r[0] for r in self.run_shared([([p], [x]) for p, x in zip(prompts, ids_list)])]
+
+
+class GGUFBackend(GraphBackend):
+    """A GGUF file in process through llama.cpp (llama-cpp-python: Metal on Apple Silicon, CUDA or CPU elsewhere). Only
+    the weights come from the GGUF file; tokenizer, chat template and CALIBRATION.json come from the Hugging Face model
+    directory, so the token ids are exactly those of the other backends. The packed prefix trie of a group (as in
+    GraphBackend: the state once, every question and option order after it) becomes llama.cpp sequences: every readout
+    has its own sequence and every token belongs to the sequences of all readouts below its block, so a shared prefix
+    is computed once and each readout sees its own prompt only. All rows of a chunk go through one llama_decode
+    (unified KV cache, cleared per chunk)."""
+
+    N_CTX = 16384  # KV cells per chunk: room for a single long prompt
+    N_SEQ = 64     # readouts (sequences) per chunk
+
+    def __init__(self, model_dir, gguf, n_gpu_layers=-1):
+        import logging
+
+        import llama_cpp as C
+        logging.getLogger("llama-cpp-python").setLevel(logging.ERROR)  # llama.cpp load / Metal info lines
+        self.C = C
+        self.tok = AutoTokenizer.from_pretrained(model_dir)
+        self.prefill = PREFILL
+        self.shared = True
+        C.llama_backend_init()
+        mp = C.llama_model_default_params()
+        mp.n_gpu_layers = n_gpu_layers
+        self.cmodel = C.llama_model_load_from_file(str(gguf).encode(), mp)
+        if not self.cmodel:
+            raise ValueError(f"llama.cpp could not load {gguf}")
+        # a full model directory: its architecture must match the GGUF file; the -GGUF repositories carry tokenizer and
+        # calibration without config.json (their .gguf files belong to them)
+        cp = Path(model_dir) / "config.json"
+        cfg = json.loads(cp.read_text()) if cp.exists() else {}
+        for name, llama_name in (("num_hidden_layers", "llama_model_n_layer"), ("hidden_size", "llama_model_n_embd")):
+            if not cfg:
+                break
+            expected = cfg.get(name)
+            if expected is None:
+                raise ValueError(f"{model_dir}/config.json is missing {name}")
+            actual = getattr(C, llama_name)(self.cmodel)
+            if actual != expected:
+                raise ValueError(f"{gguf}: {llama_name.removeprefix('llama_model_')} is {actual}, "
+                                 f"but {model_dir}/config.json specifies {name}={expected}")
+        self.n_vocab = C.llama_vocab_n_tokens(C.llama_model_get_vocab(self.cmodel))
+        expected_vocab = cfg.get("vocab_size")
+        if expected_vocab is not None and self.n_vocab != expected_vocab:
+            raise ValueError(f"{gguf}: vocabulary is {self.n_vocab}, "
+                             f"but {model_dir}/config.json specifies vocab_size={expected_vocab}")
+        if self.n_vocab < len(self.tok):
+            raise ValueError(f"{gguf}: vocabulary of {self.n_vocab} tokens, tokenizer of {model_dir} has {len(self.tok)}")
+        cp = C.llama_context_default_params()
+        cp.n_ctx = cp.n_batch = self.N_CTX
+        cp.n_ubatch = 512
+        cp.n_seq_max = self.N_SEQ
+        cp.kv_unified = True  # sequences share the cells of their common prefix
+        self.ctx = C.llama_init_from_model(self.cmodel, cp)
+        if not self.ctx:
+            raise ValueError("llama.cpp could not create a context")
+        self.batch = C.llama_batch_init(self.N_CTX, 0, self.N_SEQ)  # a prefix token belongs to every readout below it
+
+    def __del__(self):
+        C = getattr(self, "C", None)
+        if C is None:
+            return
+        if getattr(self, "batch", None) is not None:
+            C.llama_batch_free(self.batch)
+        if getattr(self, "ctx", None):
+            C.llama_free(self.ctx)
+        if getattr(self, "cmodel", None):
+            C.llama_model_free(self.cmodel)
+
+    def _oversize(self, pack, n):
+        return len(pack[0]) > self.N_CTX or n > self.N_SEQ
+
+    def _decode_chunks(self, units):
+        """Units sorted by length, cut into chunks of at most N_CTX tokens and N_SEQ readouts."""
+        out, cur, n_tok, n_seq = [], [], 0, 0
+        for k in sorted(range(len(units)), key=lambda k: len(units[k][0][0])):
+            t, r = len(units[k][0][0]), len(units[k][1])
+            if t > self.N_CTX:
+                raise ValueError(f"prompt too long for the GGUF backend: {t} tokens (max {self.N_CTX})")
+            if cur and (n_tok + t > self.N_CTX or n_seq + r > self.N_SEQ):
+                out.append(cur); cur, n_tok, n_seq = [], 0, 0
+            cur.append(k); n_tok += t; n_seq += r
+        return out + ([cur] if cur else [])
+
+    def _decode(self, packs, idx):
+        """One llama_decode for the packed rows idx -> readout logits [n_readouts, n_vocab] (float32)."""
+        C, b = self.C, self.batch
+        n, base, reads = 0, 0, []
+        for k in idx:
+            t, pos, seg, last, parent = packs[k]
+            below = [[] for _ in parent]  # sequences (readouts) below every block of the trie
+            for r, i in enumerate(last):
+                blk = seg[i]
+                while blk >= 0:
+                    below[blk].append(base + r); blk = parent[blk]
+            for tok, p, s in zip(t, pos, seg):
+                b.token[n], b.pos[n], b.logits[n] = tok, p, 0
+                b.n_seq_id[n] = len(below[s])
+                for j, q in enumerate(below[s]):
+                    b.seq_id[n][j] = q
+                n += 1
+            for i in last:
+                b.logits[n - len(t) + i] = 1
+                reads.append(n - len(t) + i)
+            base += len(last)
+        b.n_tokens = n
+        C.llama_memory_clear(C.llama_get_memory(self.ctx), False)
+        if C.llama_decode(self.ctx, b) != 0:
+            raise RuntimeError("llama_decode failed")
+        return np.stack([np.ctypeslib.as_array(C.llama_get_logits_ith(self.ctx, r), shape=(self.n_vocab,))
+                         for r in reads])
+
+    def run(self, prompts, ids_list):
+        return [r[0] for r in self.run_shared([([p], [x]) for p, x in zip(prompts, ids_list)])]
+
+    def run_shared(self, groups, policy=None):
+        units = self._units(groups)
+        probs = [None] * len(units)
+        for idx in self._decode_chunks(units):
+            lg = self._decode([u[0] for u in units], idx)
+            pr = []
+            for m, ids in enumerate(x for k in idx for x in units[k][1]):
+                z = lg[m, list(ids)].astype(np.float64)
+                e = np.exp(z - z.max())
+                pr.append((e / e.sum()).tolist())
+            j = 0
+            for k in idx:
+                n = len(units[k][1]); probs[k] = pr[j: j + n]; j += n
+        return self._assemble(groups, units, probs)
 
 
 class _HTTPLetters:

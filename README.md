@@ -57,7 +57,9 @@ scores the urgency of an incident report next week, each time with new options a
   duration, net/gross, sums, comparisons) are appended to the state, so the model reads arithmetic instead of doing
   it.
 - **More engines**: vLLM and SGLang backends (agreement with the fp32 engine, offline: vLLM 0.994, SGLang 0.995; SGLang also gives the same answer as the basal engine on 98.3% of Werdykt items), Apple Silicon
-  (`--device mps`, MLX), Ollama and llama.cpp (GGUF).
+  (MLX, `mps`, `--device mps`), Ollama and llama.cpp (GGUF, also in process with `--mode gguf`). The `mps`, `gguf` and
+  `mlx-q8` modes and the Apple Silicon engine study were contributed by Paweł Kiszczak
+  ([#4](https://github.com/rkinas/basal/pull/4)).
 
 Details of the experimental features: [docs/FEATURES.md](docs/FEATURES.md). Full list of changes:
 [release notes](https://github.com/rkinas/basal/releases/tag/v1.5.0).
@@ -94,12 +96,12 @@ basal-1.5; replace the repository name for max or mini.
 <!-- engines -->
 | engine | `basal-serve` mode | hardware | what it is for | quick start | status (basal-1.5, 4.5B) |
 |---|---|---|---|---|---|
-| **basal engine** (PyTorch) | `fast` (also `fast-nocompile`, `fp8`, `nvfp4`); `eager --device mps\|cpu` | NVIDIA GPUs (sm80+); Apple Silicon (MPS) and CPU with `eager` | the primary server: packed requests (SOAM), evidence spans, `fp8` on Hopper and Blackwell | `basal-serve --model Remek/basal-1.5-4.5B --mode fast` | **verified**: served check on one H100, 13.7 ms p50 per question over HTTP, 64.4 decisions/s with 32 clients |
+| **basal engine** (PyTorch) | `fast` (also `fast-nocompile`, `fp8`, `nvfp4`); `mps`; `eager --device mps\|cpu` | NVIDIA GPUs (sm80+); Apple Silicon with `mps` (packed requests on the Mac's GPU, no CUDA graphs) or `eager`; CPU with `eager` | the primary server: packed requests (SOAM), evidence spans, `fp8` on Hopper and Blackwell | `basal-serve --model Remek/basal-1.5-4.5B --mode fast` | **verified**: served check on one H100, 13.7 ms p50 per question over HTTP, 64.4 decisions/s with 32 clients |
 | **vLLM** | `vllm` | NVIDIA GPUs | an alternative CUDA server | `basal-serve --model Remek/basal-1.5-4.5B --mode vllm` (extra `basal[vllm]`) | **verified offline** (one H100, `basal-bench`, 1,000 development decisions): agreement 0.994 with the fp32 engine, accuracy 0.928 vs 0.930, 147 decisions/s |
 | **SGLang** | `sglang` | NVIDIA GPUs | an alternative CUDA server (RadixAttention prefix sharing) | `basal-serve --model Remek/basal-1.5-4.5B --mode sglang` (own environment: `sglang[srt]==0.5.21`, then basal with `--no-deps`) | **verified offline** (one H100, `basal-bench`, 1,000 development decisions): agreement 0.995 with the fp32 engine, accuracy 0.925 vs 0.930, 104.6 decisions/s; on Werdykt the same answer as the basal engine on 98.3% of items (97.0% for states over 8k tokens) |
-| **MLX** | `mlx` | Apple Silicon | Macs: `-MLX-8bit` (recommended) or `-MLX-fp4` (half the memory) | `basal-serve --model Remek/basal-1.5-4.5B-MLX-8bit --mode mlx` (extra `basal[mlx]`) | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.992 (`-MLX-8bit`) / 0.970 (`-MLX-fp4`), 587 / 581 ms per question |
+| **MLX** | `mlx` (default on a Mac with `basal[mlx]`); `mlx-q8` | Apple Silicon | Macs: `-MLX-8bit` (recommended) or `-MLX-fp4` (half the memory); `mlx-q8` makes 8-bit weights from bf16 at load time | `basal-serve --model Remek/basal-1.5-4.5B-MLX-8bit --mode mlx` (extra `basal[mlx]`) | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.992 (`-MLX-8bit`) / 0.970 (`-MLX-fp4`), 587 / 581 ms per question |
 | **Ollama** | `ollama` | CPU, Apple Silicon, consumer GPUs | local and desktop use with Ollama (`-GGUF`) | 1. `hf download Remek/basal-1.5-4.5B-GGUF --local-dir basal-1.5-4.5B-GGUF` 2. in that folder: `ollama create basal-1.5-4.5b:q8_0 -f Modelfile.Q8_0` 3. `basal-serve --model ./basal-1.5-4.5B-GGUF --mode ollama --ollama-model basal-1.5-4.5b:q8_0` | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.994 (`Q8_0`) / 0.980 (`Q4_K_M`), 518 / 542 ms per question |
-| **llama.cpp** | `llamacpp` | CPU, Apple Silicon, consumer GPUs | `llama-server` with the `-GGUF` files; the engine's token ids are sent as is | 1. `llama-server -m basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf -c 4096 --port 8080` 2. `basal-serve --model ./basal-1.5-4.5B-GGUF --mode llamacpp` | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.994 (`Q8_0`) / 0.980 (`Q4_K_M`), 427 / 446 ms per question |
+| **llama.cpp** | `llamacpp`; `gguf` | CPU, Apple Silicon, consumer GPUs | `llama-server` with the `-GGUF` files; the engine's token ids are sent as is. `--mode gguf --gguf <file>` runs the file in process instead (extra `basal[gguf]`, [GGUF.md](docs/GGUF.md)) | 1. `llama-server -m basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf -c 4096 --port 8080` 2. `basal-serve --model ./basal-1.5-4.5B-GGUF --mode llamacpp` | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.994 (`Q8_0`) / 0.980 (`Q4_K_M`), 427 / 446 ms per question |
 
 **`basal-serve` is the decision layer in every row.** vLLM, SGLang, MLX, Ollama and llama.cpp run the weights; the typed answers (a calibrated probability for each of your options, both option orders, the state shared by several questions, `multi`, `act` and `facts`) come from `basal-serve --mode <engine>` in front of them, with the same HTTP API in every mode. A plain `ollama run` or `llama-cli` gives free text only. Evidence spans need the PyTorch engine (`fast`, `eager`); vLLM and SGLang start with a 4,096-token context (longer states are refused); raise it with `--max-len` (e.g. 32768 for long documents). Install and first request for each engine: [quick start](#quick-start).
 <!-- /engines -->
@@ -428,9 +430,14 @@ calibration and `multi` / `act` / `facts`; the state of a request is computed on
 questions. Evidence spans are not available in this mode. Agreement with the bf16 model and speed:
 [docs/QUANTIZATION.md](docs/QUANTIZATION.md#ports-agreement-and-speed); how the ports work: [docs/PORTS.md](docs/PORTS.md).
 
-Without MLX, the PyTorch reference path also runs on Apple Silicon (slower):
-`basal-serve --model Remek/basal-1.5-mini --mode eager --device mps` (install torch from PyPI instead of the CUDA
-index).
+With `basal[mlx]` installed, `mlx` is the default mode on a Mac. `--mode mlx-q8` makes 8-bit weights from a bf16
+model at load time (about half the memory; the `-MLX-8bit` ports need no flag).
+
+Without MLX, `--mode mps` runs the PyTorch engine on the GPU of the Mac with the packed requests of `fast` (no CUDA
+graphs), with evidence spans: `basal-serve --model Remek/basal-1.5-mini --mode mps` (install torch from PyPI instead of
+the CUDA index); `--mode eager --device mps` is the plain reference. On basal-1.5-mini both `mps` and `mlx` give the
+bf16 reference's decisions on the bundled examples ([docs/HARDWARE.md](docs/HARDWARE.md#apple-silicon), which also
+has an engine comparison on an M4 Max).
 
 ### Ollama (GGUF)
 
@@ -454,10 +461,18 @@ llama-server -m basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf -c 4096 --port 8080
 basal-serve --model ./basal-1.5-4.5B-GGUF --mode llamacpp --llamacpp-url http://127.0.0.1:8080 --port 8000
 ```
 
+Without a separate server, `--mode gguf` loads the file in process through llama.cpp (extra `basal[gguf]`, i.e.
+llama-cpp-python; Metal, CUDA or CPU); the state of a request is computed once and shared by all its questions:
+
+```bash
+uv pip install "basal[gguf] @ https://github.com/rkinas/basal/archive/refs/tags/v1.5.0.tar.gz"
+basal-serve --model ./basal-1.5-4.5B-GGUF --mode gguf --gguf basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf --port 8000
+```
+
 Quantisations: `Q8_0` and `Q4_K_M` (the output head and token embeddings stay at Q8_0). Requests of one state are sent
 one after another, so the prompt cache of Ollama / llama.cpp computes the state once; `--http-parallel N` (with
 `OLLAMA_NUM_PARALLEL` / `llama-server -np`) serves concurrent clients. Evidence spans are not available in these modes.
-Details: [docs/PORTS.md](docs/PORTS.md).
+Details: [docs/PORTS.md](docs/PORTS.md), [docs/GGUF.md](docs/GGUF.md).
 
 ### CPU
 
@@ -510,7 +525,7 @@ for f in choice noul score complex; do basal-run --input basal/examples/$f.jsonl
 
 | mode | what it does | hardware |
 |---|---|---|
-| `fast` *(default)* | bf16 + `torch.compile` + CUDA graphs + SOAM packing + token-budget batching | any CUDA GPU (sm80+) |
+| `fast` *(default on CUDA)* | bf16 + `torch.compile` + CUDA graphs + SOAM packing + token-budget batching | any CUDA GPU (sm80+) |
 | `fast-nocompile` | same without compilation (start-up in seconds instead of minutes) | any CUDA GPU |
 | `fp8` | `fast` with dynamic FP8 weights + activations (torchao) | Hopper, Blackwell (Ada: FP8 compilation stalled on an RTX 4090) |
 | `nvfp4` | `fast` with NVFP4 weights + activations (torchao, experimental; costs accuracy) | Blackwell |
@@ -518,10 +533,16 @@ for f in choice noul score complex; do basal-run --input basal/examples/$f.jsonl
 | `sglang` | SGLang backend, same readout | CUDA GPUs supported by SGLang |
 | `eager` | plain PyTorch reference; `--device cuda\|mps\|cpu` (default: `BASAL_DEVICE`, else CUDA, else Apple Silicon, else CPU) | any GPU, Apple Silicon (MPS) or CPU |
 | `fast-exit` | `fast` + trained early-exit heads, exit policy chosen per request | models that ship `exit_heads/` (basal-1.0 only; the 1.5 models do not) |
-| `mlx` | Apple Silicon with MLX / mlx-lm: the `-MLX-8bit` / `-MLX-fp4` ports or bf16 weights; shared-prefix KV cache | Apple Silicon |
+| `mlx` *(default on Apple Silicon with `basal[mlx]`)* | Apple Silicon with MLX / mlx-lm: the `-MLX-8bit` / `-MLX-fp4` ports or bf16 weights; shared-prefix KV cache | Apple Silicon |
+| `mlx-q8` | `mlx` with 8-bit weights made from bf16 at load time (about half the memory, not faster) | Apple Silicon |
+| `mps` | the PyTorch engine on the Mac's GPU: SOAM packing + token-budget batching, no CUDA graphs; evidence spans | Apple Silicon |
+| `gguf` | a GGUF file in process through llama.cpp (`--gguf <file>`, extra `basal[gguf]`); SOAM as llama.cpp sequences | Apple Silicon (Metal), CUDA, CPU |
 | `ollama` | the basal server in front of Ollama (GGUF ports; `--ollama-model`, `--ollama-url`) | anything Ollama runs on |
 | `llamacpp` | the basal server in front of `llama-server` (GGUF ports; `--llamacpp-url`) | anything llama.cpp runs on |
 
+- Without `--mode`: `fast` on CUDA, `mlx` on Apple Silicon (`mps` without `basal[mlx]`), `eager` otherwise.
+  `--quant fp8|nvfp4` applies to the CUDA graph modes and `--quant q8` to `mlx`; other combinations are refused at
+  start-up.
 - `--calibration file.json` overrides the calibration file (default: `CALIBRATION.<mode>.json` when the model ships
   one for that engine, else `CALIBRATION.json`).
 - **Two option orders** (`--orders 2`, default): every question is asked with the options in original and reversed
@@ -544,7 +565,8 @@ Two tools are installed with the package. Both run out of the box on the bundled
 with gold answers in `basal/examples/`):
 
 ```bash
-# offline: latency, throughput and agreement of serving modes (no HTTP); put eager-fp32 first as the reference
+# offline: latency, throughput and agreement of serving modes (no HTTP); the first mode is the reference
+# (default: eager-fp32 and the serving default; on Apple Silicon bf16 mps and mlx)
 basal-bench --model Remek/basal-1.5-4.5B --modes eager-fp32 fast fp8 --out bench.json
 
 # end to end over HTTP against a running server (basal-serve ...)
@@ -558,9 +580,9 @@ basal-loadtest --url http://127.0.0.1:8000/v1/systemone
 | `lat2 ms` | median latency of one decision with **both** option orders at batch size 1 (what the server does by default) |
 | `lat1 ms` | the same with one option order |
 | `dec/s` | two-order decisions per second when 32 option-order passes are processed together |
-| `agree` | share of decisions whose top option equals the first mode's (use `eager-fp32` first) |
+| `agree` | share of decisions whose top option equals the first mode's (use `eager-fp32` first; on Apple Silicon the default reference is bf16 `mps`, not fp32: `--modes eager-fp32 mps mlx` if memory allows; each JSON row records `reference_mode`) |
 | `acc` | accuracy against `gold` |
-| `GB` | peak GPU memory |
+| `GB` | CUDA / MLX peak allocation; MPS memory held by the Metal driver; empty for CPU and the GGUF modes |
 
 `basal-loadtest` reports the median and p95 latency of sequential requests and the decisions per second with 32
 concurrent clients.
@@ -735,7 +757,9 @@ basal-1.0 (September 2026; 4.5B and 1.5B, plus FP8 / NVFP4 ModelOpt checkpoints)
 95% intervals of the strongest systems. Its full tables, methods and limitations are in the
 [basal-1.0 technical report](docs/basal-1.pdf) and the [v1.0.1 README](https://github.com/rkinas/basal/tree/v1.0.1).
 The engine of this release serves basal-1.0 models unchanged (`--model Remek/basal-1.0-4.5B`); `fast-exit` and the
-`vllm` mode with the ModelOpt checkpoints work as before.
+`vllm` mode with the ModelOpt checkpoints work as before. Apple Silicon conversions of basal-1.0 by Paweł Kiszczak
+(GGUF F16 / Q8_0 / Q4_K_M, MLX 8-bit, oQ6e) are on [Hugging Face](https://huggingface.co/pawelkiszczak); how they
+compare: [docs/HARDWARE.md](docs/HARDWARE.md#quantised-formats-mlx-omlx-oq-gguf).
 
 ## Citation
 
