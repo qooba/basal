@@ -122,7 +122,7 @@ footing:
   (with injected instructions), retrieval / RAG, contracts, routing, score, judge (answer grading), action (the next
   step of an agent) and abstain ("cannot be determined" vs a concrete answer).
 - **Closed dataset.** The items are not published, so they cannot end up in training data; only a few samples per
-  category are public ([basal.si5.pl](https://basal.si5.pl/)). No Werdykt item, document or passage is in basal's
+  category are public ([basal.si5.pl](https://basal.si5.pl/)). No Werdykt item or source document is in basal's
   training data (checked by exact and shared-phrase matching).
 - **One protocol for every model**: one call per item, the same pinned prompt (state, question, lettered options,
   JSON answer), unparsed answers count as wrong. Open models are served on **one H100**; API models are called through
