@@ -1,4 +1,4 @@
-# basal
+# basal 1.5
 
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--1.5%20collection-yellow)](https://huggingface.co/collections/Remek/basal-15-6ac0de0e9199d121c6adac20)
 [![Website](https://img.shields.io/badge/web-basal.si5.pl-0a7d5a)](https://basal.si5.pl/)
@@ -31,7 +31,7 @@ scores the urgency of an incident report next week, each time with new options a
 
 > The name comes from the *basal ganglia*, the part of the brain that selects one action among competing options.
 
-## What is new since basal-1.0
+## What is new in basal-1.5
 
 **Models**
 - A family of three: **basal-1.5** (4.5B, main model), **basal-1.5-max** (11B, the most accurate in the family) and
