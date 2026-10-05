@@ -474,6 +474,36 @@ one after another, so the prompt cache of Ollama / llama.cpp computes the state 
 `OLLAMA_NUM_PARALLEL` / `llama-server -np`) serves concurrent clients. Evidence spans are not available in these modes.
 Details: [docs/PORTS.md](docs/PORTS.md), [docs/GGUF.md](docs/GGUF.md).
 
+### Google TPU (JAX)
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/qooba/basal/blob/main/notebooks/tpu.ipynb)
+— [`notebooks/tpu.ipynb`](notebooks/tpu.ipynb) installs basal on a Colab TPU runtime, answers the bundled examples
+and benchmarks latency, throughput and agreement with fp32.
+
+On a TPU VM (Cloud TPU or a Colab TPU runtime), `--mode tpu` runs the model in JAX on plain-JAX kernels compiled by
+XLA (RMSNorm, fused QKV, SwiGLU, RoPE and the shared-prefix attention mask, ported from the `jax_native` path of
+basal-on-tpu-dev). It keeps the packing of `fast`: shared prefix, the same shape buckets and token-budget batching.
+Each (batch, length) bucket compiles to one XLA executable, and the decoder layers run as one `lax.scan`. Install CPU
+torch (only the tokenizer and chat template use transformers), then the `tpu` extra:
+
+```bash
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install -e ".[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+basal-serve --model Remek/basal-1.0-4.5B --port 8000        # default on a TPU VM: --mode tpu
+```
+
+- **Speed** (TPU v5e-1, both option orders, the 44 bundled examples): 4.5B **17.9 ms** per decision, 49 dec/s; 1.5B
+  **6.6 ms**, 145 dec/s; HTTP p50 for the 1.5B 8.3 ms, 109 dec/s with 32 clients.
+- **Agreement** with the fp32 transformers reference: 1.000 for the 4.5B in bf16, 0.977 (one item) for the 1.5B in
+  bf16, 1.000 for the 1.5B with `basal-bench --modes tpu-fp32`.
+- **Memory.** The 4.5B model needs 9.6 GB of bf16 weights, which fits the 16 GB of one v5e chip. `tpu-fp32` fits
+  only the 1.5B model.
+- **Start-up.** The server compiles every bucket shape before it accepts requests: about 2 minutes for the 1.5B on a
+  v5e. Executables are cached in `~/.cache/basal/jax` (or `$JAX_COMPILATION_CACHE_DIR`), so a restart takes about
+  25 s. Prompts longer than 3,072 tokens get a length rounded up to a multiple of 512, compiled on first use.
+- **Pin** `jax[tpu]==0.11.1` (needs Python 3.12 or newer). On Colab, the preinstalled jax ships a `libtpu` that cannot run code from its own
+  `jaxlib`, so force-install the pinned pair. Early exit and quantisation are not available on TPU.
+
 ### CPU
 
 `basal-serve --model Remek/basal-1.5-mini --mode eager --device cpu` runs everywhere, for tests and low volumes.
@@ -539,6 +569,7 @@ for f in choice noul score complex; do basal-run --input basal/examples/$f.jsonl
 | `gguf` | a GGUF file in process through llama.cpp (`--gguf <file>`, extra `basal[gguf]`); SOAM as llama.cpp sequences | Apple Silicon (Metal), CUDA, CPU |
 | `ollama` | the basal server in front of Ollama (GGUF ports; `--ollama-model`, `--ollama-url`) | anything Ollama runs on |
 | `llamacpp` | the basal server in front of `llama-server` (GGUF ports; `--llamacpp-url`) | anything llama.cpp runs on |
+| `tpu` *(default on a TPU VM)* | JAX / XLA bf16 + SOAM packing + token-budget batching, one compiled executable per shape ([Google TPU](#google-tpu-jax)) | Google TPU (`[tpu]` extra) |
 
 - Without `--mode`: `fast` on CUDA, `mlx` on Apple Silicon (`mps` without `basal[mlx]`), `eager` otherwise.
   `--quant fp8|nvfp4` applies to the CUDA graph modes and `--quant q8` to `mlx`; other combinations are refused at
