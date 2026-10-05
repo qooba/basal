@@ -47,24 +47,26 @@ def rope(x, pos, cos, sin):
     return jnp.concatenate([x1 * c - x2 * s, x1 * s + x2 * c], -1).astype(x.dtype)
 
 
-def segment_mask(seg):
-    """seg (b, L): 0 = shared prefix, g > 0 = option block g, -1 = padding -> bool (b, L, L).
-    allowed(i, j) = j <= i and (seg[j] == 0 or seg[j] == seg[i]): each option block sees the prefix and itself only.
-    Padding sits after every real token, so causality hides it from every row that is read out."""
-    L = seg.shape[1]
-    si, sj = seg[:, :, None], seg[:, None, :]
-    return jnp.tril(jnp.ones((L, L), jnp.bool_))[None] & ((sj == 0) | (sj == si))
+def tree_mask(end):
+    """end (b, L): for every token, the end (exclusive) of the subtree of its block in the depth-first packed prefix
+    trie (padding: its own index + 1) -> bool (b, L, L). allowed(i, j) = j <= i and i < end[j]: in depth-first order
+    the queries inside the subtree of key j's block are exactly those of its own block and its descendants, so every
+    token sees its ancestor blocks and itself only, as in a separate forward of its own prompt. Padding sits after
+    every real token, so causality hides it from every row that is read out."""
+    L = end.shape[1]
+    i = jnp.arange(L, dtype=end.dtype)
+    return (i[None, None, :] <= i[None, :, None]) & (i[None, :, None] < end[:, None, :])
 
 
-def attention(q, k, v, seg, scale):
-    """q (b, nh, L, d), k / v (b, nkv, L, d) with GQA, seg (b, L) -> (b, nh, L, d). The query heads of one KV head
-    are grouped instead of repeating K / V, so K / V are never copied per query head."""
+def attention(q, k, v, end, scale):
+    """q (b, nh, L, d), k / v (b, nkv, L, d) with GQA, end (b, L) (see tree_mask) -> (b, nh, L, d). The query heads
+    of one KV head are grouped instead of repeating K / V, so K / V are never copied per query head."""
     b, nh, L, d = q.shape
     nkv = k.shape[1]
     prec = dot_precision(q.dtype)
     qg = q.reshape(b, nkv, nh // nkv, L, d)
     s = jnp.einsum("bkgqd,bkld->bkgql", qg, k, precision=prec, preferred_element_type=jnp.float32) * scale
-    s = jnp.where(segment_mask(seg)[:, None, None], s, -jnp.inf)
+    s = jnp.where(tree_mask(end)[:, None, None], s, -jnp.inf)
     p = jax.nn.softmax(s, axis=-1)
     o = jnp.einsum("bkgql,bkld->bkgqd", p.astype(v.dtype), v, precision=prec)
     return o.reshape(b, nh, L, d).astype(q.dtype)

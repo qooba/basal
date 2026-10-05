@@ -1,5 +1,5 @@
-"""TPU backend (JAX; runs on CPU here): the packed shared-prefix forward and the letter readout equal separate PyTorch
-forwards of the same checkpoint (tiny random Llama with the basal-1.0 architecture options: attention / MLP biases,
+"""TPU backend (JAX; runs on CPU here): the packed prefix-trie forward (state once, ask many) and the letter readout
+equal separate PyTorch forwards of the same checkpoint (tiny random Llama with the basal-1.0 architecture options: attention / MLP biases,
 GQA, rope_theta 1e6 in rope_parameters)."""
 import pytest
 
@@ -10,7 +10,8 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from basal.engine import GraphBackend
-from basal.tpu import TPUBackend
+from basal.tpu import TPUBackend, subtree_ends
+from basal.tpu_kernels import tree_mask
 
 V = 64
 
@@ -57,14 +58,30 @@ A, B = [1, 5, 9, 11, 3, 4, 6, 40, 41, 42], [1, 5, 9, 11, 3, 8, 2, 7, 50]
 LETTERS = [10, 20, 30]
 
 
-def test_shared_equals_separate_torch(backend, ckpt):
+# One request over one state: two questions x two option orders, plus a third question that shares only the state.
+STATE = [1, 5, 9, 11, 3]
+SOAM = [STATE + [4, 6, 40, 41, 42], STATE + [4, 6, 41, 40, 42], STATE + [8, 2, 7, 50], STATE + [8, 2, 50, 7],
+        STATE + [4, 12]]
+
+
+def test_tree_mask_equals_graph_mask():
+    class Stub(GraphBackend):
+        def __init__(self):  # _mask_from_seg only needs the parameter dtype
+            self.model = torch.nn.Linear(1, 1)
+
+    ids, pos, seg, last, parent = GraphBackend._pack(SOAM)
+    assert len(parent) > 3  # a real trie: state, shared question prefix, option-order leaves
+    L = len(ids) + 3
+    ref = Stub()._mask_from_seg(torch.tensor([seg + [-1] * 3]), [parent])[0, 0] == 0
+    end = np.array([subtree_ends(seg, parent) + list(range(len(ids) + 1, L + 1))], np.int32)
+    assert np.array_equal(np.asarray(tree_mask(end))[0], ref.numpy())
+
+
+def test_soam_group_equals_separate_torch(backend, ckpt):
     _, m = ckpt
-    slots = backend._letters([LETTERS])
-    ids, pos, seg, last = GraphBackend._pack([A, B])
-    lg = backend._forward_rows([(ids, pos, seg, last)], 1, 32)[0]
-    for o, t in enumerate((A, B)):
-        p = np.exp(lg[o, [slots[i] for i in LETTERS]] - lg[o, [slots[i] for i in LETTERS]].max())
-        assert np.allclose(p / p.sum(), torch_probs(m, t, LETTERS), atol=1e-5)
+    (probs,) = backend.run_shared([(SOAM, [LETTERS] * len(SOAM))])
+    for t, p in zip(SOAM, probs):
+        assert np.allclose(p, torch_probs(m, t, LETTERS), atol=1e-5)
 
 
 def test_run_shared_batch_and_long_prompt(backend, ckpt):

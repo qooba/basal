@@ -481,28 +481,35 @@ Details: [docs/PORTS.md](docs/PORTS.md), [docs/GGUF.md](docs/GGUF.md).
 and benchmarks latency, throughput and agreement with fp32.
 
 On a TPU VM (Cloud TPU or a Colab TPU runtime), `--mode tpu` runs the model in JAX on plain-JAX kernels compiled by
-XLA (RMSNorm, fused QKV, SwiGLU, RoPE and the shared-prefix attention mask, ported from the `jax_native` path of
-basal-on-tpu-dev). It keeps the packing of `fast`: shared prefix, the same shape buckets and token-budget batching.
-Each (batch, length) bucket compiles to one XLA executable, and the decoder layers run as one `lax.scan`. Install CPU
-torch (only the tokenizer and chat template use transformers), then the `tpu` extra:
+XLA (RMSNorm, fused QKV, SwiGLU, RoPE and the prefix-trie attention mask, ported from the `jax_native` path of
+basal-on-tpu-dev). It keeps the packing of `fast`: the state computed once for every question and option order of a
+request (SOAM), the same shape buckets and token-budget batching. Each (batch, length) bucket compiles to one XLA
+executable, and the decoder layers run as one `lax.scan`. Install CPU torch (only the tokenizer and chat template use
+transformers), then the `tpu` extra:
 
 ```bash
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 uv pip install -e ".[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-basal-serve --model Remek/basal-1.0-4.5B --port 8000        # default on a TPU VM: --mode tpu
+basal-serve --model Remek/basal-1.5-4.5B --port 8000        # default on a TPU VM: --mode tpu
 ```
 
-- **Speed** (TPU v5e-1, both option orders, the 44 bundled examples): 4.5B **17.9 ms** per decision, 49 dec/s; 1.5B
-  **6.6 ms**, 145 dec/s; HTTP p50 for the 1.5B 8.3 ms, 109 dec/s with 32 clients.
-- **Agreement** with the fp32 transformers reference: 1.000 for the 4.5B in bf16, 0.977 (one item) for the 1.5B in
-  bf16, 1.000 for the 1.5B with `basal-bench --modes tpu-fp32`.
-- **Memory.** The 4.5B model needs 9.6 GB of bf16 weights, which fits the 16 GB of one v5e chip. `tpu-fp32` fits
-  only the 1.5B model.
-- **Start-up.** The server compiles every bucket shape before it accepts requests: about 2 minutes for the 1.5B on a
-  v5e. Executables are cached in `~/.cache/basal/jax` (or `$JAX_COMPILATION_CACHE_DIR`), so a restart takes about
-  25 s. Prompts longer than 3,072 tokens get a length rounded up to a multiple of 512, compiled on first use.
-- **Pin** `jax[tpu]==0.11.1` (needs Python 3.12 or newer). On Colab, the preinstalled jax ships a `libtpu` that cannot run code from its own
-  `jaxlib`, so force-install the pinned pair. Early exit and quantisation are not available on TPU.
+- **Speed** (TPU v5e-1, both option orders, the 44 bundled examples, `basal-bench`): basal-1.5 **17.7 ms** per
+  decision, 49.5 dec/s; basal-1.5-mini **6.7 ms**, 146 dec/s. Over HTTP (`basal-loadtest`, 32 clients): 19.0 ms
+  p50 and 36 dec/s for basal-1.5, 7.9 ms p50 and 112 dec/s for mini.
+- **Many questions per request**: one state of 464 tokens with 1 / 5 / 12 questions takes 23.5 / 46.9 / 110.3 ms
+  (basal-1.5) and 9.0 / 18.0 / 37.9 ms (mini) over HTTP, with the same answers as separate requests (12/12, max
+  |Δp| 0.016 in bf16).
+- **Agreement** with the fp32 transformers reference: 1.000 for basal-1.5 and basal-1.5-mini in bf16 (and for mini
+  with `basal-bench --modes tpu-fp32`).
+- **Memory.** basal-1.5 needs 9.6 GB of bf16 weights, which fits the 16 GB of one v5e chip; basal-1.5-max (22 GB)
+  does not. `tpu-fp32` fits only mini.
+- **Start-up.** The server compiles every bucket shape before it accepts requests: about 3 minutes on a v5e.
+  Executables are cached in `~/.cache/basal/jax` (or `$JAX_COMPILATION_CACHE_DIR`), so a restart takes well under a
+  minute. Prompts longer than 3,072 tokens get a length rounded up to a multiple of 512, compiled on first use.
+- **Not on TPU:** evidence spans (they need the in-process PyTorch model; the request is refused), early exit and
+  quantisation.
+- **Pin** `jax[tpu]==0.11.1` (needs Python 3.12 or newer). On Colab, the preinstalled jax ships a `libtpu` that
+  cannot run code from its own `jaxlib`, so force-install the pinned pair.
 
 ### CPU
 
