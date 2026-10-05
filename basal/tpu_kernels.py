@@ -1,0 +1,70 @@
+"""Plain-JAX kernels of the TPU backend
+"""
+import math
+import jax
+import jax.numpy as jnp
+
+
+def dot_precision(dtype):
+    return jax.lax.Precision.HIGHEST if dtype == jnp.float32 else None
+
+
+def rms_norm(x, w, eps=1e-6):
+    """x (..., H), w (H,): normalised in fp32, returned in x.dtype."""
+    x32 = x.astype(jnp.float32)
+    x32 = x32 / jnp.sqrt(jnp.mean(x32 * x32, axis=-1, keepdims=True) + eps)
+    return (x32 * w).astype(x.dtype)
+
+
+def linear(x, w, b=None):
+    """x (M, K) @ w (K, N) + b (N,), fp32 accumulation."""
+    out = jnp.dot(x, w, preferred_element_type=jnp.float32, precision=dot_precision(x.dtype))
+    if b is not None:
+        out = out + b.astype(jnp.float32)
+    return out.astype(x.dtype)
+
+
+def swiglu(x, wg, bg, wu, bu):
+    """silu(x @ wg + bg) * (x @ wu + bu); biases are added before the activation (Llama mlp_bias)."""
+    prec = dot_precision(x.dtype)
+    g = jnp.dot(x, wg, preferred_element_type=jnp.float32, precision=prec) + bg.astype(jnp.float32)
+    u = jnp.dot(x, wu, preferred_element_type=jnp.float32, precision=prec) + bu.astype(jnp.float32)
+    return (g * jax.nn.sigmoid(g) * u).astype(x.dtype)
+
+
+def rope_cache(n, head_dim, theta):
+    """cos / sin tables (n, head_dim // 2), fp32."""
+    inv = jnp.exp(jnp.arange(head_dim // 2, dtype=jnp.float32) * -(math.log(theta) * 2.0 / head_dim))
+    ang = jnp.arange(n, dtype=jnp.float32)[:, None] * inv[None]
+    return jnp.cos(ang), jnp.sin(ang)
+
+
+def rope(x, pos, cos, sin):
+    """x (b, L, heads, d), pos (b, L): HF "rotate half" RoPE at explicit positions."""
+    half = x.shape[-1] // 2
+    c, s = cos[pos][:, :, None], sin[pos][:, :, None]
+    x1, x2 = x[..., :half], x[..., half:]
+    return jnp.concatenate([x1 * c - x2 * s, x1 * s + x2 * c], -1).astype(x.dtype)
+
+
+def segment_mask(seg):
+    """seg (b, L): 0 = shared prefix, g > 0 = option block g, -1 = padding -> bool (b, L, L).
+    allowed(i, j) = j <= i and (seg[j] == 0 or seg[j] == seg[i]): each option block sees the prefix and itself only.
+    Padding sits after every real token, so causality hides it from every row that is read out."""
+    L = seg.shape[1]
+    si, sj = seg[:, :, None], seg[:, None, :]
+    return jnp.tril(jnp.ones((L, L), jnp.bool_))[None] & ((sj == 0) | (sj == si))
+
+
+def attention(q, k, v, seg, scale):
+    """q (b, nh, L, d), k / v (b, nkv, L, d) with GQA, seg (b, L) -> (b, nh, L, d). The query heads of one KV head
+    are grouped instead of repeating K / V, so K / V are never copied per query head."""
+    b, nh, L, d = q.shape
+    nkv = k.shape[1]
+    prec = dot_precision(q.dtype)
+    qg = q.reshape(b, nkv, nh // nkv, L, d)
+    s = jnp.einsum("bkgqd,bkld->bkgql", qg, k, precision=prec, preferred_element_type=jnp.float32) * scale
+    s = jnp.where(segment_mask(seg)[:, None, None], s, -jnp.inf)
+    p = jax.nn.softmax(s, axis=-1)
+    o = jnp.einsum("bkgql,bkld->bkgqd", p.astype(v.dtype), v, precision=prec)
+    return o.reshape(b, nh, L, d).astype(q.dtype)

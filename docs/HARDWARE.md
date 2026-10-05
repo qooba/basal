@@ -17,6 +17,7 @@ on a private 500-item sample of the Polish/English test split.
 | Desktop with unified memory (DGX Spark GB10) | `fp8` | memory-bandwidth-bound; FP8 halves latency |
 | Batched high-throughput serving on Blackwell | `vllm` + `-NVFP4` checkpoint | 3.2× throughput on the DGX Spark (the only machine where it was measured), but −3 accuracy points |
 | A100 and other GPUs without FP8 (not measured) | `fast` | the bf16 path runs on any sm80+ GPU |
+| Google TPU (v5e measured) | `tpu` (bf16) | XLA-compiled JAX with the shared prefix; the 4.5B fits one 16 GB v5e chip and agrees 1.000 with fp32 |
 | Apple Silicon (M-series Mac) | `mlx` with the original checkpoint; `gguf` with the F16 GGUF for the closest match to fp32; 8-bit / oQ6e checkpoints on 16 GB Macs | compute-bound: every format runs at the same speed, quantised weights only save memory; converted repos in the [README](../README.md#apple-silicon-mlx--mps) remain private until release |
 
 Add `--mode fast-exit` to let requests choose `"early_exit": "0.99"` (about 1.15× faster, agreement ≥ 0.99).
@@ -269,6 +270,26 @@ cool-down; *TV*: mean / max total-variation distance to fp32, *changed*: decisio
 ![Per-item distance to fp32 by format](figures/apple_formats_heatmap.png)
 
 Figures: `python docs/figures/make_figures.py` (matplotlib) from the measurements in `docs/figures/apple_engines.json`.
+
+## Google TPU
+
+`--mode tpu` on a Colab TPU v5e-1 (`TPU v5 lite`), JAX 0.11.1, the 44 bundled examples (`basal-bench`; reference:
+`eager-fp32` transformers on the VM's CPU).
+
+| model | mode | 2 orders (ms) | 1 order (ms) | dec/s | agreement | accuracy |
+|---|---|---|---|---|---|---|
+| basal-1.0-4.5B | `eager-fp32` (CPU) | 4701.5 | 2941.1 | 0.2 | reference | 0.795 |
+| | `tpu` (bf16) | **17.9** | 16.2 | **49.3** | 1.000 | 0.795 |
+| basal-1.0-1.5B | `eager-fp32` (CPU) | 1464.0 | 910.8 | 0.7 | reference | 0.727 |
+| | `tpu-fp32` | 29.8 | 23.0 | 26.9 | 1.000 | 0.727 |
+| | `tpu` (bf16) | **6.6** | 6.1 | **145.5** | 0.977 | 0.750 |
+| | HTTP `tpu` (p50, 32 clients) | 8.3 | – | 108.8 | – | – |
+
+A TPU is compute-bound already at batch 1, because a single prompt sends hundreds of rows through every matmul.
+Batching adds about 1.25× (basal-on-tpu-dev, batch scaling), so tight length buckets matter more than large batches.
+Start-up compiles every bucket shape (about 2 minutes for the 1.5B, cached for later starts). The bf16 weights take
+3.2 GB (1.5B) and 9.6 GB (4.5B) of HBM. The `GB` column of `basal-bench` is the process-wide peak, so after a
+`tpu-fp32` run in the same invocation it still shows the fp32 peak.
 
 ## Notes per platform
 

@@ -1,0 +1,89 @@
+"""TPU backend (JAX; runs on CPU here): the packed shared-prefix forward and the letter readout equal separate PyTorch
+forwards of the same checkpoint (tiny random Llama with the basal-1.0 architecture options: attention / MLP biases,
+GQA, rope_theta 1e6 in rope_parameters)."""
+import pytest
+
+pytest.importorskip("jax")
+
+import numpy as np
+import torch
+from transformers import LlamaConfig, LlamaForCausalLM
+
+from basal.engine import GraphBackend
+from basal.tpu import TPUBackend
+
+V = 64
+
+
+class Tok:  # token ids given directly as lists
+    pad_token, pad_token_id = "<pad>", 0
+
+    def __call__(self, ids, add_special_tokens=False):
+        return type("E", (), {"input_ids": list(ids)})()
+
+
+@pytest.fixture(scope="module")
+def ckpt(tmp_path_factory):
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=V, hidden_size=64, intermediate_size=96, num_hidden_layers=2, num_attention_heads=4,
+                      num_key_value_heads=2, head_dim=16, attention_bias=True, mlp_bias=True,
+                      max_position_embeddings=128, rope_parameters={"rope_type": "default", "rope_theta": 1e6},
+                      tie_word_embeddings=False)
+    m = LlamaForCausalLM(cfg).eval()
+    for p in m.parameters():  # random biases (initialised to zero), so that a missing bias would show up
+        torch.nn.init.normal_(p, std=0.2)
+    d = tmp_path_factory.mktemp("tiny")
+    m.save_pretrained(d)
+    return d, m
+
+
+@pytest.fixture(scope="module")
+def backend(ckpt):
+    mp = pytest.MonkeyPatch()  # stand-in tokenizer instead of a Hugging Face tokenizer
+    mp.setattr("basal.tpu.AutoTokenizer.from_pretrained", lambda _: Tok())
+    mp.setattr(TPUBackend, "LENS", [16, 32])
+    mp.setattr(TPUBackend, "BATCHES", [1, 2, 4])
+    yield TPUBackend(ckpt[0], "float32", warm=False)
+    mp.undo()
+
+
+def torch_probs(m, ids, letters):
+    with torch.no_grad():
+        lg = m(input_ids=torch.tensor([ids])).logits[0, -1].double()
+    return torch.softmax(lg[letters], -1).numpy()
+
+
+A, B = [1, 5, 9, 11, 3, 4, 6, 40, 41, 42], [1, 5, 9, 11, 3, 8, 2, 7, 50]
+LETTERS = [10, 20, 30]
+
+
+def test_shared_equals_separate_torch(backend, ckpt):
+    _, m = ckpt
+    slots = backend._letters([LETTERS])
+    ids, pos, seg, last = GraphBackend._pack([A, B])
+    lg = backend._forward_rows([(ids, pos, seg, last)], 1, 32)[0]
+    for o, t in enumerate((A, B)):
+        p = np.exp(lg[o, [slots[i] for i in LETTERS]] - lg[o, [slots[i] for i in LETTERS]].max())
+        assert np.allclose(p / p.sum(), torch_probs(m, t, LETTERS), atol=1e-5)
+
+
+def test_run_shared_batch_and_long_prompt(backend, ckpt):
+    _, m = ckpt
+    rng = np.random.default_rng(0)
+    long = [1] + rng.integers(3, V, 40).tolist()  # longer than the largest bucket: rounded up to 512
+    groups = [([A, B], [LETTERS, LETTERS]), ([B[:5] + [12], B[:5] + [13, 14]], [LETTERS, [30, 20]]),
+              ([long, long[:-1] + [4]], [LETTERS, LETTERS])]
+    res = backend.run_shared(groups)
+    for (prompts, lids), probs in zip(groups, res):
+        for t, li, p in zip(prompts, lids, probs):
+            assert np.allclose(p, torch_probs(m, t, li), atol=1e-5)
+    assert np.allclose(backend.run([A], [LETTERS])[0], torch_probs(m, A, LETTERS), atol=1e-5)
+
+
+def test_one_row_per_order(ckpt, monkeypatch):
+    _, m = ckpt
+    monkeypatch.setattr("basal.tpu.AutoTokenizer.from_pretrained", lambda _: Tok())
+    be = TPUBackend(ckpt[0], "float32", shared=False, warm=False)
+    (pa, pb), = be.run_shared([([A, B], [LETTERS, LETTERS])])
+    assert np.allclose(pa, torch_probs(m, A, LETTERS), atol=1e-5)
+    assert np.allclose(pb, torch_probs(m, B, LETTERS), atol=1e-5)

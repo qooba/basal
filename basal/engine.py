@@ -11,6 +11,7 @@ Backends:
   MPSBackend        GraphBackend's shared prefix + token-budget batching on Apple MPS (PyTorch, no graphs)
   MLXBackend        the same packing on Apple MLX (Metal), optional 8-bit weights
   VLLMBackend       vLLM, for ModelOpt FP8 / NVFP4 checkpoints (native low-precision kernels)
+  TPUBackend        (basal/tpu.py) the same packing in JAX on Google TPU, one XLA executable per shape
 """
 import json
 from pathlib import Path

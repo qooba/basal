@@ -36,11 +36,12 @@ MODES = {
     "mps": ("mps", None, False),            # Apple Silicon: PyTorch MPS + shared prefix, no graphs
     "gguf": ("gguf", None, False),          # llama.cpp on a GGUF file (--gguf; Metal, CUDA or CPU) + shared prefix
     "ollama": ("ollama", None, False),     # Ollama safetensors import; raw prompts + next-token logprobs
+    "tpu": ("tpu", None, False),            # Google TPU: JAX / XLA + shared prefix, one executable per shape
 }
 
 
 def default_mode():
-    """fast on CUDA, MLX on Apple Silicon when mlx and mlx-lm are installed, MPS otherwise."""
+    """fast on CUDA, MLX on Apple Silicon when mlx and mlx-lm are installed, MPS otherwise, tpu on a TPU VM with JAX."""
     if torch.cuda.is_available():
         return "fast"
     if torch.backends.mps.is_available():
@@ -50,6 +51,9 @@ def default_mode():
             return "mlx"
         except ImportError:
             return "mps"
+    from .tpu import tpu_available
+    if tpu_available():
+        return "tpu"
     return "eager"
 
 
@@ -152,6 +156,9 @@ class Server:
             self.backend = GGUFBackend(md, a.gguf)
         elif kind == "ollama":
             self.backend = OllamaBackend(md, a.ollama_model, a.ollama_url)
+        elif kind == "tpu":
+            from .tpu import TPUBackend
+            self.backend = TPUBackend(md, a.dtype, shared=a.orders == 2)
         else:
             self.backend = GraphBackend(md, a.dtype, quant, compile=comp, shared=a.orders == 2)
         self.tok = self.backend.tok
@@ -253,7 +260,8 @@ def parser():
     ap.add_argument("--revision", default=None)
     ap.add_argument("--name", default=None, help="model name reported in responses (default: last part of --model)")
     ap.add_argument("--mode", choices=list(MODES), default=None,
-                    help="default: fast on CUDA, mlx on Apple Silicon (mps without mlx or mlx-lm), eager otherwise")
+                    help="default: fast on CUDA, mlx on Apple Silicon (mps without mlx or mlx-lm), tpu on a TPU VM, "
+                         "eager otherwise")
     ap.add_argument("--quant", choices=["fp8", "nvfp4", "q8"], default=None,
                     help="override the quantisation of the mode (fp8 / nvfp4: CUDA modes, q8: mlx)")
     ap.add_argument("--dtype", default="bfloat16")
