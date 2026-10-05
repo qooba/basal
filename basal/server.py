@@ -262,7 +262,7 @@ class Server:
             self.backend = LlamaCppBackend(md, a.llamacpp_url, parallel=a.http_parallel)
         elif kind == "tpu":
             from .tpu import TPUBackend
-            self.backend = TPUBackend(md, a.dtype, shared=a.orders == 2)
+            self.backend = TPUBackend(md, a.dtype, shared=a.orders == 2, max_len=a.max_len)
         else:
             self.backend = GraphBackend(md, a.dtype, quant, compile=comp, shared=a.orders == 2)
         self.tok = self.backend.tok
@@ -454,7 +454,8 @@ def parser():
     ap.add_argument("--log-decisions", dest="log_decisions", default=None, help="append a propensity log (JSONL)")
     ap.add_argument("--gpu-memory", dest="gpu_memory", type=float, default=0.6, help="vLLM memory fraction")
     ap.add_argument("--max-len", dest="max_len", type=int, default=4096,
-                    help="--mode vllm / sglang: context length in tokens (longer states are refused; raise it for long documents)")
+                    help="--mode vllm / sglang / tpu: context length in tokens (longer states are refused; raise it for "
+                         "long documents)")
     ap.add_argument("--gguf", default=None, help="--mode gguf: GGUF weights (a -GGUF file or one converted from --model)")
     ap.add_argument("--ollama-url", dest="ollama_url", default="http://127.0.0.1:11434", help="--mode ollama")
     ap.add_argument("--ollama-model", dest="ollama_model", default=None,

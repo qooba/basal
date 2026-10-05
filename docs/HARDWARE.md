@@ -362,6 +362,18 @@ Many questions about one state (HTTP, one request, a 464-token state, p50): basa
 basal-1.5-mini 9.0 / 18.0 / 37.9 ms for 1 / 5 / 12 questions, about 2.5× faster than one request per question; every
 answer equals the same question asked alone (12/12, max |Δp| 0.016 in bf16).
 
+Long prompts (`--max-len`; blocked attention above 3,072 tokens, one prompt per forward, both option orders):
+
+| model | 3.4k tokens | 5.9k | 7.9k | 11.9k | 15.9k | 23.9k | 31.9k |
+|---|---|---|---|---|---|---|---|
+| basal-1.5 (4.5B) | 0.65 s | 0.99 s | 1.46 s | 2.62 s | 4.09 s | 7.66 s | 12.53 s |
+| basal-1.5-mini | 0.21 s | 0.35 s | 0.53 s | – | – | – | – |
+
+The blocked attention equals the full softmax (max |Δp| 1.5e-6 against the fp32 CPU reference at 5.9k tokens, both in
+fp32); HBM stays at about 9 GB for basal-1.5 up to 32k tokens. XLA's full-row softmax is not used there because on a
+v5e it hits a cliff at some lengths (6,144 / 8,192 keys: 128 / 291 ms per attention for mini shapes, against 2.1 /
+3.6 ms with blocks of 1,024 queries and keys).
+
 A TPU is compute-bound already at batch 1, because a single prompt sends hundreds of rows through every matmul.
 Batching adds about 1.25× (basal-on-tpu-dev, batch scaling), so tight length buckets matter more than large batches.
 Start-up compiles every bucket shape (about 3 minutes, cached for later starts). The bf16 weights take 3.2 GB (mini)

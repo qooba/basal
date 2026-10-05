@@ -503,9 +503,15 @@ basal-serve --model Remek/basal-1.5-4.5B --port 8000 --mode tpu
   with `basal-bench --modes tpu-fp32`).
 - **Memory.** basal-1.5 needs 9.6 GB of bf16 weights, which fits the 16 GB of one v5e chip; basal-1.5-max (22 GB)
   does not. `tpu-fp32` fits only mini.
-- **Start-up.** The server compiles every bucket shape before it accepts requests: about 3 minutes on a v5e.
-  Executables are cached in `~/.cache/basal/jax` (or `$JAX_COMPILATION_CACHE_DIR`), so a restart takes well under a
-  minute. Prompts longer than 3,072 tokens get a length rounded up to a multiple of 512, compiled on first use.
+- **Long documents.** As with vLLM / SGLang, `--max-len` (default 4,096 tokens, at most the model's positions) caps
+  the prompt; longer states are refused with an error. Above 3,072 tokens the attention runs in blocks (online
+  softmax), so memory grows with the length, not its square: basal-1.5 answers a 32k-token state in 12.5 s
+  (8k: 1.5 s; mini at 8k: 0.5 s) with the weights and activations in about 9 GB. Start with e.g.
+  `--max-len 32768` for long documents (each extra length bucket adds a few seconds of start-up).
+- **Start-up.** The server compiles every bucket shape up to `--max-len` before it accepts requests (also the
+  readout of requests with up to 32 questions), so no request waits for a compilation: about 3–3.5 minutes on a
+  v5e. Executables are cached in `~/.cache/basal/jax` (or `$JAX_COMPILATION_CACHE_DIR`), so a restart takes well
+  under a minute. `--mode tpu` fails at start-up if JAX sees no TPU, and accepts `--dtype bfloat16` or `float32`.
 - **Not on TPU:** evidence spans (they need the in-process PyTorch model; the request is refused), early exit and
   quantisation.
 - **Pin** `jax[tpu]==0.11.1` (needs Python 3.12 or newer). On Colab, the preinstalled jax ships a `libtpu` that
