@@ -476,13 +476,13 @@ Details: [docs/PORTS.md](docs/PORTS.md), [docs/GGUF.md](docs/GGUF.md).
 
 ### Google TPU (JAX)
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/qooba/basal/blob/main/notebooks/tpu.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rkinas/basal/blob/main/notebooks/tpu.ipynb)
 — [`notebooks/tpu.ipynb`](notebooks/tpu.ipynb) installs basal on a Colab TPU runtime, answers the bundled examples
 and benchmarks latency, throughput and agreement with fp32.
 
 On a TPU VM (Cloud TPU or a Colab TPU runtime), `--mode tpu` runs the model in JAX on plain-JAX kernels compiled by
-XLA (RMSNorm, fused QKV, SwiGLU, RoPE and the prefix-trie attention mask, ported from the `jax_native` path of
-basal-on-tpu-dev). It keeps the packing of `fast`: the state computed once for every question and option order of a
+XLA (RMSNorm, fused QKV, SwiGLU, RoPE and the prefix-trie attention mask). 
+It keeps the packing of `fast`: the state computed once for every question and option order of a
 request (SOAM), the same shape buckets and token-budget batching. Each (batch, length) bucket compiles to one XLA
 executable, and the decoder layers run as one `lax.scan`. Install CPU torch (only the tokenizer and chat template use
 transformers), then the `tpu` extra:
@@ -490,7 +490,7 @@ transformers), then the `tpu` extra:
 ```bash
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 uv pip install -e ".[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-basal-serve --model Remek/basal-1.5-4.5B --port 8000        # default on a TPU VM: --mode tpu
+basal-serve --model Remek/basal-1.5-4.5B --port 8000 --mode tpu
 ```
 
 - **Speed** (TPU v5e-1, both option orders, the 44 bundled examples, `basal-bench`): basal-1.5 **17.7 ms** per
